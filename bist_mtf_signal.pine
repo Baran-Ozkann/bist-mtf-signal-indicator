@@ -84,6 +84,7 @@ const string G_L1   = "Layer 1 - Regime / Trend Filter"
 const string G_L2   = "Layer 2 - PAC Crossover"
 const string G_L3   = "Layer 3 - Momentum (RSI + MACD)"
 const string G_L4   = "Layer 4 - Volume Confirmation"
+const string G_L5   = "Layer 5 - 1D Directional Lock (hard veto)"
 const string G_DISP = "Display"
 
 // ---------------------------------------------------------------- General ---
@@ -135,6 +136,25 @@ volRatioLo = input.float(0.5, "Low anchor: vol / avg",  minval = 0.0, step = 0.1
 volConfLo  = input.float(0.2, "Low anchor: confidence", minval = 0.0, maxval = 1.0, step = 0.05, group = G_L4)
 volRatioHi = input.float(2.0, "High anchor: vol / avg", minval = 0.1, step = 0.1, group = G_L4)
 volConfHi  = input.float(1.0, "High anchor: confidence", minval = 0.0, maxval = 1.0, step = 0.05, group = G_L4)
+
+// ------------------------------------- Layer 5 (hard veto, NOT weighted) ---
+useVeto = input.bool(true, "Enable 1D hard veto", group = G_L5,
+     tooltip = "Layer 5 carries no weight. It is a gate: if the 4h candidate direction disagrees " +
+     "with the locked 1D bias - or the 1D bias is neutral - the ENTIRE score is zeroed before " +
+     "display. Turn OFF to inspect the raw pre-veto score while tuning layers 1-4.")
+biasTF = input.timeframe("1D", "Bias timeframe", group = G_L5)
+biasConfirmedOnly = input.bool(true, "Use last CLOSED bias bar only (no repaint)", group = G_L5,
+     tooltip = "ON  = repaint-safe. The bias is read one bar back inside the bias timeframe, so " +
+     "realtime and historical values are identical under bar replay. Costs up to one extra day of lag.\n" +
+     "OFF = uses the developing daily bar. Less lag, but the value mutates intrabar and historical " +
+     "bars will NOT match what you saw live. Debugging only.")
+dAdxLen     = input.int(14, "1D ADX / DI length", minval = 1, group = G_L5)
+dAdxSmooth  = input.int(14, "1D ADX smoothing",   minval = 1, group = G_L5)
+dAdxThr     = input.float(25.0, "1D ADX threshold", minval = 0.0, step = 0.5, group = G_L5)
+dSmaLen     = input.int(50,  "1D SMA length",  minval = 1, group = G_L5)
+dEmaFastLen = input.int(21,  "1D EMA fast",    minval = 1, group = G_L5)
+dEmaMedLen  = input.int(50,  "1D EMA medium",  minval = 1, group = G_L5)
+dEmaSlowLen = input.int(200, "1D EMA slow",    minval = 1, group = G_L5)
 
 // ---------------------------------------------------------------- Display ---
 showComponents = input.bool(false, "Plot long / short component scores", group = G_DISP)
