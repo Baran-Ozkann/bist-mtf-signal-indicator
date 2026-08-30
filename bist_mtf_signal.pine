@@ -20,7 +20,7 @@
 // ============================================================================
 //  request.security() CALL INVENTORY  (Stage 2)
 // ============================================================================
-//  COUNT: 1  (budget target for the finished script: 4-5)
+//  COUNT: 2  (budget target for the finished script: 4-5)
 //
 //  #1  Directional bias lock          [Stage 2]
 //      symbol    : syminfo.tickerid          (never hardcoded)
@@ -33,6 +33,19 @@
 //      CONSOLIDATION: the ADX / SMA / triple-EMA regime test is evaluated
 //      INSIDE the daily context and only the finished verdict plus three
 //      diagnostics come back, so all six daily series cost one call, not six.
+//
+//  #2  Entry timing                   [Stage 3]
+//      symbol    : syminfo.tickerid
+//      timeframe : entryTF input, default "60"
+//      expression: f_entryExpr(off, pacLen, minBody)
+//                  -> [touchLong, touchShort, confLong, confShort] as ints
+//      lookahead : barmerge.lookahead_off
+//      gaps      : barmerge.gaps_off  (the last known touch/confirmation
+//                  state must persist across chart bars; gaps_on would
+//                  blank it and the entry could never arm)
+//      CONSOLIDATION: PAC channel, touch test and confirmation candle are
+//      all evaluated inside the entry timeframe; four booleans come back
+//      instead of six price series.
 //
 //  Chart-timeframe work needs no security call: Heikin Ashi is derived
 //  arithmetically from the chart's own real OHLC (see the HA block below)
@@ -485,6 +498,61 @@ f_dailyBiasExpr(simple int off) =>
 
 // nz guard: before the first bias bar resolves the tuple is na -> neutral.
 dBias = nz(dBiasRaw, 0)
+
+// ============================================================================
+//  ENTRY TIMING (default 1h)
+// ============================================================================
+//  Activates once the signal-timeframe score crosses the threshold. Looks for
+//  a micro PAC touch plus a directional candle confirmation.
+//
+//  PAC touch (long) : the bar wicked down into the channel (low <= PAC upper)
+//                     but closed at or above PAC mid - it touched and held,
+//                     rather than falling through. Short is mirrored.
+//  Confirmation     : a real-bodied candle in the signal direction, body at
+//                     least entryMinBody of the bar range so dojis are
+//                     rejected.
+//
+//  MIXED-CANDLE POLICY: the PAC and its touch test use the selected candle
+//  source (Heikin Ashi by default). The confirmation candle uses REAL OHLC
+//  unconditionally - see the note on the candle primitives.
+// ============================================================================
+f_entryExpr(simple int off, simple int pacLen, float minBody) =>
+    // Heikin Ashi rebuilt inside THIS timeframe's context from its own real
+    // OHLC, so no extra security call is needed for the HA series.
+    float _haC = (open + high + low + close) / 4.0
+    var float _haO = na
+    _haO := na(_haO[1]) ? (open + close) / 2.0 : (_haO[1] + _haC[1]) / 2.0
+    float _haH = math.max(high, math.max(_haO, _haC))
+    float _haL = math.min(low,  math.min(_haO, _haC))
+    // PAC source honours the global Heikin Ashi toggle.
+    float _sC = useHA ? _haC : close
+    float _sH = useHA ? _haH : high
+    float _sL = useHA ? _haL : low
+    float _pU = ta.ema(_sH, pacLen)
+    float _pL = ta.ema(_sL, pacLen)
+    float _pM = ta.ema(_sC, pacLen)
+    bool _touchL = not na(_pU) and not na(_pM) and _sL <= _pU and _sC >= _pM
+    bool _touchS = not na(_pL) and not na(_pM) and _sH >= _pL and _sC <= _pM
+    // Confirmation candle: REAL OHLC only.
+    float _br = f_bodyRatio(open, high, low, close)
+    bool _confL = close > open and _br >= minBody
+    bool _confS = close < open and _br >= minBody
+    // Ints rather than bools across the security boundary: an int carries an
+    // unambiguous nz() default, whereas an na bool is easy to mis-handle.
+    int _tL = _touchL ? 1 : 0
+    int _tS = _touchS ? 1 : 0
+    int _cL = _confL  ? 1 : 0
+    int _cS = _confS  ? 1 : 0
+    [_tL[off], _tS[off], _cL[off], _cS[off]]
+
+[eTouchLr, eTouchSr, eConfLr, eConfSr] = request.security(syminfo.tickerid, entryTF,
+     f_entryExpr(entryConfirmedOnly ? 1 : 0, entryPacLen, entryMinBody),
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+entryTouchLong  = nz(eTouchLr, 0) == 1
+entryTouchShort = nz(eTouchSr, 0) == 1
+entryConfLong   = nz(eConfLr,  0) == 1
+entryConfShort  = nz(eConfSr,  0) == 1
 
 // ---------------------------------------------------------------- The veto ---
 // Score is zeroed BEFORE display, per spec - not merely hidden downstream.
