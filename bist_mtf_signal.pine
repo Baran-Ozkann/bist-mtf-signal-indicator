@@ -18,17 +18,48 @@
 //  [ ] Stage 10 End-to-end / repaint testing
 //
 // ============================================================================
-//  request.security() CALL INVENTORY  (Stage 1)
+//  request.security() CALL INVENTORY  (Stage 2)
 // ============================================================================
-//  COUNT: 0
-//  Stage 1 is computed entirely on the CHART timeframe. Heikin Ashi values are
-//  derived arithmetically from the chart's own real OHLC (see f_ha* below)
-//  rather than via request.security(ticker.heikinashi(...)), which:
-//    - saves a security call for the Stage 2-5 budget,
-//    - is inherently repaint-safe (no higher-TF lookahead involved),
-//    - keeps real OHLC available on the same bar for layers 9 & 11 later.
+//  COUNT: 1  (budget target for the finished script: 4-5)
+//
+//  #1  Directional bias lock          [Stage 2]
+//      symbol    : syminfo.tickerid          (never hardcoded)
+//      timeframe : biasTF input, default "1D"
+//      expression: f_dailyBiasExpr(off) -> [bias, adx, smaSide, emaSide]
+//      lookahead : barmerge.lookahead_off    (mandatory, no future data)
+//      gaps      : barmerge.gaps_off         (hold last known bias between
+//                  daily closes; gaps_on would blank the bias on every
+//                  intermediate chart bar and drop the veto to neutral)
+//      CONSOLIDATION: the ADX / SMA / triple-EMA regime test is evaluated
+//      INSIDE the daily context and only the finished verdict plus three
+//      diagnostics come back, so all six daily series cost one call, not six.
+//
+//  Chart-timeframe work needs no security call: Heikin Ashi is derived
+//  arithmetically from the chart's own real OHLC (see the HA block below)
+//  rather than via request.security(ticker.heikinashi(...)). That saves a
+//  call, is inherently repaint-safe, and keeps real OHLC available on the
+//  same bar for layers 9 & 11 later.
+//
 //  Recommended chart timeframe: 4h (the spec's primary signal timeframe).
-//  Nothing here breaks on another TF; Stage 2 adds explicit MTF references.
+//  Nothing breaks on another TF; the bias reference is timeframe-agnostic.
+//
+// ============================================================================
+//  REPAINT NOTE ON THE 1D REFERENCE
+// ============================================================================
+//  lookahead_off alone is NOT sufficient for realtime/historical parity. With
+//  lookahead_off the historical bars of a forming daily bar show the LAST
+//  CLOSED daily value, but the realtime bar shows the DEVELOPING daily value,
+//  which mutates tick by tick. Those two behaviours disagree, which is exactly
+//  the discrepancy bar-replay testing exposes.
+//
+//  Fix: biasConfirmedOnly (default ON) offsets the expression by one bar
+//  INSIDE the daily context, so the value returned is always a fully closed
+//  daily bar and is therefore identical historically and in realtime.
+//  The offset must be applied inside the request (expr[1]); applying [1] to
+//  the result outside would step back one CHART bar, not one DAILY bar.
+//  Cost: the bias reflects the daily bar before last, i.e. up to one extra
+//  day of lag. Turning the input OFF removes that lag and reintroduces
+//  intrabar repainting of the developing daily bar - debugging only.
 //
 // ============================================================================
 //  MIXED-CANDLE POLICY (enforced from Stage 1 onward)
