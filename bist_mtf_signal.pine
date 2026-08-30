@@ -7,8 +7,8 @@
 //  BUILD STATUS
 // ============================================================================
 //  [x] Stage 1  Core layers 1-4 + simple total score
-//  [x] Stage 2  MTF architecture (1D lock + hard veto)        <-- CURRENT
-//  [ ] Stage 3  1h entry timing + 15m exhaustion gate
+//  [x] Stage 2  MTF architecture (1D lock + hard veto)
+//  [x] Stage 3  1h entry timing + 15m exhaustion gate        <-- CURRENT
 //  [ ] Stage 4  Mid-tier layers 6-8
 //  [ ] Stage 5  Advanced layers 9-13
 //  [ ] Stage 6  Cooldown + earnings blacklist
@@ -18,7 +18,7 @@
 //  [ ] Stage 10 End-to-end / repaint testing
 //
 // ============================================================================
-//  request.security() CALL INVENTORY  (Stage 2)
+//  request.security() CALL INVENTORY  (Stage 3)
 // ============================================================================
 //  COUNT: 3  (budget target for the finished script: 4-5)
 //
@@ -85,6 +85,36 @@
 //  Cost: the bias reflects the daily bar before last, i.e. up to one extra
 //  day of lag. Turning the input OFF removes that lag and reintroduces
 //  intrabar repainting of the developing daily bar - debugging only.
+//
+// ============================================================================
+//  ENTRY GATE TIMING - READ BEFORE INTERPRETING BACKTEST RESULTS
+// ============================================================================
+//  The 1D bias (call #1) is a HIGHER timeframe than the chart and is fully
+//  repaint-safe. Calls #2 and #3 are different: on the recommended 4h chart
+//  the 1h and 15m references are LOWER timeframes, and that changes what
+//  request.security can honestly give us.
+//
+//  Two consequences, neither of which is a bug to be fixed:
+//
+//  1. Only the LAST lower-TF value inside each chart bar is visible. Pine
+//     does not hand back the full intrabar sequence here, so on historical
+//     bars the gate reflects the final 1h/15m state of that 4h bar, not the
+//     moment the gate actually opened during it.
+//  2. The gate is BY DESIGN a realtime, intrabar construct. Its whole purpose
+//     is to confirm entry timing while the 4h bar is still forming. A gate
+//     that only resolved at 4h close would be useless for the job the spec
+//     gives it.
+//
+//  So: the SCORE and the 1D VETO are repaint-safe and may be read at any
+//  time. The ENTRY and EXHAUSTION gates will move within a forming chart bar.
+//  For backtest fidelity, judge signals on chart-bar CLOSE only.
+//  entryConfirmedOnly / exhaustConfirmedOnly reduce the movement by reading
+//  one bar back inside each lower timeframe; they cannot eliminate it,
+//  because the underlying limitation is consequence 1, not the offset.
+//
+//  Running the indicator ON the 15m or 1h chart makes these references equal
+//  to or higher than the chart timeframe, which removes the issue entirely at
+//  the cost of a noisier signal timeframe.
 //
 // ============================================================================
 //  MIXED-CANDLE POLICY (enforced from Stage 1 onward)
@@ -222,6 +252,9 @@ exhaustConfirmedOnly = input.bool(true, "Exhaustion TF: use last CLOSED bar only
 showComponents = input.bool(false, "Plot long / short component scores", group = G_DISP)
 showRawScore   = input.bool(false, "Plot raw pre-veto score", group = G_DISP)
 showBias       = input.bool(false, "Plot 1D bias (0 short / 50 neutral / 100 long)", group = G_DISP)
+showGates      = input.bool(false, "Plot entry / exhaustion gate states", group = G_DISP,
+     tooltip = "Stepped debug traces: score armed (30), entry ready (60), entry signal (90). " +
+     "Replaced by proper markers in Stage 7.")
 
 // ============================================================================
 //  HELPERS
@@ -627,6 +660,28 @@ totalScore = vetoPassed ? rawScore : 0.0
 finalDir   = vetoPassed ? sigDir   : 0
 
 // ============================================================================
+//  SIGNAL ASSEMBLY - three sequential gates
+// ============================================================================
+//  scoreArmed  : post-veto score crossed the threshold with a locked direction
+//  entryReady  : entry timeframe shows a PAC touch AND a confirmation candle
+//  entrySignal : exhaustion gate has opened in the same direction
+//  Each stage can be disabled independently, in which case it passes through.
+// ============================================================================
+scoreArmed = totalScore >= scoreThreshold and finalDir != 0
+
+entryTouchOk = finalDir > 0 ? entryTouchLong : entryTouchShort
+entryConfOk  = finalDir > 0 ? entryConfLong  : entryConfShort
+entryReady   = scoreArmed and (not useEntryTiming or (entryTouchOk and entryConfOk))
+
+exhaustOk   = finalDir > 0 ? exhaustLong : exhaustShort
+exhaustWhy  = finalDir > 0 ? exhReasonL  : exhReasonS
+entrySignal = entryReady and (not useExhaustGate or exhaustOk)
+
+// Fires on the bar the gate opens, not on every bar it stays open. Stage 6
+// adds the cooldown; Stage 9 attaches the alert to this.
+entrySignalFresh = entrySignal and not entrySignal[1]
+
+// ============================================================================
 //  PLOTS  (minimal, plot()/hline() only - no plotshape, no colour
 //          coding of signals; that arrives in Stage 7)
 // ============================================================================
@@ -635,6 +690,14 @@ plot(showRawScore   ? rawScore   : na, "Raw Score (pre-veto)", color = color.new
 plot(showComponents ? longScore  : na, "Long Score",  color = color.new(color.teal,   35))
 plot(showComponents ? shortScore : na, "Short Score", color = color.new(color.maroon, 35))
 plot(showBias ? (dBias + 1) * 50 : na, "1D Bias", color = color.new(color.orange, 40),
+     style = plot.style_stepline)
+
+// Gate traces: stacked so the three stages are distinguishable at a glance.
+plot(showGates and scoreArmed  ? 30 : na, "Score Armed", color = color.new(color.blue, 50),
+     style = plot.style_stepline)
+plot(showGates and entryReady  ? 60 : na, "Entry Ready", color = color.new(color.purple, 30),
+     style = plot.style_stepline)
+plot(showGates and entrySignal ? 90 : na, "Entry Signal", color = color.new(color.fuchsia, 10),
      style = plot.style_stepline)
 
 hline(scoreThreshold, "Threshold", color = color.new(color.gray, 40), linestyle = hline.style_dashed)
