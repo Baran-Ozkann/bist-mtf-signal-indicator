@@ -353,6 +353,57 @@ sigDir     = longScore > shortScore ? 1 : (shortScore > longScore ? -1 : 0)
 totalScore = math.max(longScore, shortScore)
 
 // ============================================================================
+//  LAYER 5 - MTF DIRECTIONAL LOCK (1D)          HARD VETO, NOT WEIGHTED
+// ============================================================================
+//  All three sub-conditions must agree for the bias to lock:
+//    a) ADX(14) > 25            - is there a trend at all (non-directional)
+//    b) close vs SMA(50)        - which side of the mean
+//    c) EMA fast > med > slow   - stacking order confirms the same side
+//  Any disagreement, or ADX below threshold, or na during warm-up -> 0
+//  (neutral) and the system produces no signal. Neutral is the SAFE default:
+//  a newly listed ticker without 200 daily bars yields no signals rather
+//  than false ones. Lower the 1D EMA slow length for short-history names.
+// ============================================================================
+f_biasFrom(float adxv, float adxThreshold, float px, float sma, float ef, float em, float es) =>
+    int b = 0
+    if na(adxv) or na(px) or na(sma) or na(ef) or na(em) or na(es)
+        b := 0
+    else if adxv <= adxThreshold
+        b := 0
+    else
+        bool bullAll = px > sma and ef > em and em > es
+        bool bearAll = px < sma and ef < em and em < es
+        b := bullAll ? 1 : (bearAll ? -1 : 0)
+    b
+
+// Evaluated INSIDE the bias timeframe by request.security (call #1).
+// `off` shifts the read one bias-bar back when biasConfirmedOnly is ON; the
+// shift must happen here, in the daily context, not on the returned series.
+// Real OHLC is used here deliberately - see MIXED-CANDLE POLICY. The daily
+// lock is a coarse regime gate where HA smoothing adds lag without benefit,
+// and keeping it on real candles avoids mixing candle types across a veto.
+f_dailyBiasExpr(simple int off) =>
+    [_dp, _dm, _adxRaw] = ta.dmi(dAdxLen, dAdxSmooth)
+    float _adx = _adxRaw[off]
+    float _px  = close[off]
+    float _sma = ta.sma(close, dSmaLen)[off]
+    float _ef  = ta.ema(close, dEmaFastLen)[off]
+    float _em  = ta.ema(close, dEmaMedLen)[off]
+    float _es  = ta.ema(close, dEmaSlowLen)[off]
+    int _bias = f_biasFrom(_adx, dAdxThr, _px, _sma, _ef, _em, _es)
+    int _smaSide = na(_px) or na(_sma) ? 0 : (_px > _sma ? 1 : -1)
+    int _emaSide = na(_ef) or na(_em) or na(_es) ? 0 :
+     ((_ef > _em and _em > _es) ? 1 : ((_ef < _em and _em < _es) ? -1 : 0))
+    [_bias, _adx, _smaSide, _emaSide]
+
+[dBiasRaw, dAdxVal, dSmaSide, dEmaSide] = request.security(syminfo.tickerid, biasTF,
+     f_dailyBiasExpr(biasConfirmedOnly ? 1 : 0),
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+// nz guard: before the first bias bar resolves the tuple is na -> neutral.
+dBias = nz(dBiasRaw, 0)
+
+// ============================================================================
 //  PLOTS  (Stage 1: minimal, plot()/hline() only - no plotshape, no colour
 //          coding of signals; that arrives in Stage 7)
 // ============================================================================
