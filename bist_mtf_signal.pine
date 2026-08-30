@@ -85,6 +85,8 @@ const string G_L2   = "Layer 2 - PAC Crossover"
 const string G_L3   = "Layer 3 - Momentum (RSI + MACD)"
 const string G_L4   = "Layer 4 - Volume Confirmation"
 const string G_L5   = "Layer 5 - 1D Directional Lock (hard veto)"
+const string G_ENT  = "Entry Timing (1h)"
+const string G_EXH  = "Exhaustion Gate (15m)"
 const string G_DISP = "Display"
 
 // ---------------------------------------------------------------- General ---
@@ -156,6 +158,41 @@ dEmaFastLen = input.int(21,  "1D EMA fast",    minval = 1, group = G_L5)
 dEmaMedLen  = input.int(50,  "1D EMA medium",  minval = 1, group = G_L5)
 dEmaSlowLen = input.int(200, "1D EMA slow",    minval = 1, group = G_L5)
 
+// ------------------------------------------------- Entry timing (1h) ---
+useEntryTiming = input.bool(true, "Enable 1h entry timing", group = G_ENT,
+     tooltip = "Once the signal-timeframe score crosses the threshold, the entry timeframe must " +
+     "show a PAC touch AND a directional candle before the setup is called 'entry ready'. " +
+     "Turn OFF to treat any threshold cross as entry ready.")
+entryTF = input.timeframe("60", "Entry timing timeframe", group = G_ENT)
+entryPacLen = input.int(34, "Entry PAC length", minval = 1, group = G_ENT)
+entryMinBody = input.float(0.30, "Min candle body / range ratio", minval = 0.0, maxval = 1.0,
+     step = 0.05, group = G_ENT,
+     tooltip = "Rejects doji-like confirmation candles. Body must be at least this fraction of the " +
+     "bar's full range. Uses REAL OHLC, never Heikin Ashi.")
+entryConfirmedOnly = input.bool(true, "Entry TF: use last CLOSED bar only", group = G_ENT,
+     tooltip = "Offsets the read one bar inside the entry timeframe. See the ENTRY GATE TIMING note " +
+     "in the header for why this does not fully remove intrabar movement when the entry timeframe " +
+     "is LOWER than the chart timeframe.")
+
+// ---------------------------------------------- Exhaustion gate (15m) ---
+useExhaustGate = input.bool(true, "Enable 15m exhaustion gate", group = G_EXH,
+     tooltip = "Blocks the entry signal until the counter-move exhausts. Opens when ANY ONE of the " +
+     "three conditions below is met. Turn OFF to let entry-ready setups signal immediately.")
+exhaustTF = input.timeframe("15", "Exhaustion timeframe", group = G_EXH)
+exhRsiLen = input.int(14, "Exhaustion RSI length", minval = 1, group = G_EXH)
+exhRsiFlat = input.float(1.0, "RSI flat threshold (points)", minval = 0.0, step = 0.1, group = G_EXH,
+     tooltip = "Condition 1: RSI is considered 'no longer progressing' when its bar-over-bar change " +
+     "is within this many points while the prior change ran against the signal direction.")
+exhSwingLb = input.int(5, "Swing lookback (bars)", minval = 2, maxval = 50, group = G_EXH,
+     tooltip = "Condition 3: window used to define a 'new' extreme.")
+exhSwingBars = input.int(3, "Bars without a new extreme", minval = 1, maxval = 50, group = G_EXH,
+     tooltip = "Condition 3 opens when this many bars have passed without a new lower-low (long) " +
+     "or higher-high (short) inside the swing lookback window.")
+pinMaxBody = input.float(0.35, "Pin bar: max body / range", minval = 0.01, maxval = 1.0,
+     step = 0.05, group = G_EXH)
+pinMinWick = input.float(2.0, "Pin bar: min wick / body", minval = 0.5, step = 0.1, group = G_EXH)
+exhaustConfirmedOnly = input.bool(true, "Exhaustion TF: use last CLOSED bar only", group = G_EXH)
+
 // ---------------------------------------------------------------- Display ---
 showComponents = input.bool(false, "Plot long / short component scores", group = G_DISP)
 showRawScore   = input.bool(false, "Plot raw pre-veto score", group = G_DISP)
@@ -168,6 +205,51 @@ showBias       = input.bool(false, "Plot 1D bias (0 short / 50 neutral / 100 lon
 // Clamp v into [lo, hi]. na in -> na out (callers guard before calling).
 f_clamp(float v, float lo, float hi) =>
     math.max(lo, math.min(hi, v))
+
+// ----------------------------------------------------- Candle primitives ---
+// These take explicit OHLC arguments rather than reading the globals, so the
+// caller decides which candle type is fed in. Per MIXED-CANDLE POLICY every
+// caller of these MUST pass REAL OHLC - pattern recognition on Heikin Ashi
+// bars is meaningless (HA opens are synthetic midpoints, so nearly every HA
+// bar looks like an engulfing). Shared by the 1h confirmation, the 15m
+// exhaustion gate, and layer 11 in Stage 5.
+
+// Body size as a fraction of the bar's full range. Zero-range bar -> 0.0.
+f_bodyRatio(float o, float h, float l, float c) =>
+    float rng = h - l
+    na(o) or na(h) or na(l) or na(c) or rng <= 0.0 ? 0.0 : math.abs(c - o) / rng
+
+// Pin bar / hammer. dir > 0 wants a long LOWER wick (lower prices rejected),
+// dir < 0 a long UPPER wick. Requires a small body and the rejection wick to
+// dominate the opposite wick.
+f_isPinBar(int dir, float o, float h, float l, float c, float maxBody, float minWick) =>
+    bool res = false
+    float rng = h - l
+    if na(o) or na(h) or na(l) or na(c) or rng <= 0.0
+        res := false
+    else
+        float body = math.abs(c - o)
+        float upWick = h - math.max(o, c)
+        float dnWick = math.min(o, c) - l
+        bool smallBody = body / rng <= maxBody
+        // Floor the divisor at 1% of range so a doji (body ~ 0) cannot make
+        // the wick/body ratio explode to infinity or divide by zero.
+        float bodySafe = math.max(body, rng * 0.01)
+        res := dir > 0 ? (smallBody and dnWick >= minWick * bodySafe and dnWick > upWick)
+             :           (smallBody and upWick >= minWick * bodySafe and upWick > dnWick)
+    res
+
+// Engulfing: current real body fully covers the previous real body and the
+// two bars are opposite colours.
+f_isEngulfing(int dir, float o, float c, float po, float pc) =>
+    bool res = false
+    if na(o) or na(c) or na(po) or na(pc)
+        res := false
+    else if dir > 0
+        res := c > o and pc < po and c >= po and o <= pc
+    else
+        res := c < o and pc > po and c <= po and o >= pc
+    res
 
 // ============================================================================
 //  HEIKIN ASHI (computed from this chart's real OHLC - no security call)
