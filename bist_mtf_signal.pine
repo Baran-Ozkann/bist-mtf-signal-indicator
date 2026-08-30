@@ -6,8 +6,8 @@
 // ============================================================================
 //  BUILD STATUS
 // ============================================================================
-//  [x] Stage 1  Core layers 1-4 + simple total score          <-- CURRENT
-//  [ ] Stage 2  MTF architecture (1D lock + hard veto)
+//  [x] Stage 1  Core layers 1-4 + simple total score
+//  [x] Stage 2  MTF architecture (1D lock + hard veto)        <-- CURRENT
 //  [ ] Stage 3  1h entry timing + 15m exhaustion gate
 //  [ ] Stage 4  Mid-tier layers 6-8
 //  [ ] Stage 5  Advanced layers 9-13
