@@ -20,7 +20,7 @@
 // ============================================================================
 //  request.security() CALL INVENTORY  (Stage 2)
 // ============================================================================
-//  COUNT: 2  (budget target for the finished script: 4-5)
+//  COUNT: 3  (budget target for the finished script: 4-5)
 //
 //  #1  Directional bias lock          [Stage 2]
 //      symbol    : syminfo.tickerid          (never hardcoded)
@@ -46,6 +46,18 @@
 //      CONSOLIDATION: PAC channel, touch test and confirmation candle are
 //      all evaluated inside the entry timeframe; four booleans come back
 //      instead of six price series.
+//
+//  #3  Exhaustion gate                [Stage 3]
+//      symbol    : syminfo.tickerid
+//      timeframe : exhaustTF input, default "15"
+//      expression: f_exhaustExpr(off, rsiLen, flat, swingLb, swingBars,
+//                  maxBody, minWick)
+//                  -> [openLong, openShort, reasonLong, reasonShort] as ints
+//      lookahead : barmerge.lookahead_off
+//      gaps      : barmerge.gaps_off  (gate state must persist across chart
+//                  bars rather than blanking between exhaustion-TF closes)
+//      CONSOLIDATION: RSI slope, pin/engulfing and the swing-extreme test
+//      are all resolved inside the exhaustion timeframe; four ints return.
 //
 //  Chart-timeframe work needs no security call: Heikin Ashi is derived
 //  arithmetically from the chart's own real OHLC (see the HA block below)
@@ -553,6 +565,59 @@ entryTouchLong  = nz(eTouchLr, 0) == 1
 entryTouchShort = nz(eTouchSr, 0) == 1
 entryConfLong   = nz(eConfLr,  0) == 1
 entryConfShort  = nz(eConfSr,  0) == 1
+
+// ============================================================================
+//  EXHAUSTION GATE (default 15m)                        BOOLEAN, NOT SCORED
+// ============================================================================
+//  Opens when ANY ONE of the three spec conditions is met, evaluated in the
+//  direction of the pending signal. For a long the gate is asking "has the
+//  pullback stopped falling?", for a short "has the bounce stopped rising?".
+//
+//  1) RSI no longer progressing - either it turned (slope flipped into the
+//     signal direction) or it flattened (|change| within exhRsiFlat) while
+//     the previous bar was still running against us.
+//  2) Pin bar or engulfing in the signal direction - REAL OHLC.
+//  3) Last N bars stopped making new lower-lows (long) / higher-highs
+//     (short): the most recent extreme inside the swing window was set at
+//     least exhSwingBars bars ago.
+//
+//  Reason code returned for debugging: 0 none, 1 RSI, 2 pattern, 3 swing
+//  (priority order, first match wins - it is a diagnostic, not a ranking).
+// ============================================================================
+f_exhaustExpr(simple int off, simple int rsiLen, float flatThr, simple int swingLb,
+     simple int swingBars, float maxBody, float minWick) =>
+    float _rsi = ta.rsi(close, rsiLen)
+    float _d1 = _rsi - _rsi[1]
+    float _d2 = _rsi[1] - _rsi[2]
+    bool _rsiOkL = not na(_d1) and not na(_d2) and
+     ((_d1 > 0 and _d2 <= 0) or (math.abs(_d1) <= flatThr and _d2 < 0))
+    bool _rsiOkS = not na(_d1) and not na(_d2) and
+     ((_d1 < 0 and _d2 >= 0) or (math.abs(_d1) <= flatThr and _d2 > 0))
+    // REAL OHLC for the pattern tests, per MIXED-CANDLE POLICY.
+    bool _patL = f_isPinBar(1, open, high, low, close, maxBody, minWick) or
+     f_isEngulfing(1, open, close, open[1], close[1])
+    bool _patS = f_isPinBar(-1, open, high, low, close, maxBody, minWick) or
+     f_isEngulfing(-1, open, close, open[1], close[1])
+    // ta.barssince is computed unconditionally - never inside a branch.
+    int _sinceLow  = ta.barssince(low  <= ta.lowest(low,   swingLb))
+    int _sinceHigh = ta.barssince(high >= ta.highest(high, swingLb))
+    bool _swingOkL = nz(_sinceLow,  0) >= swingBars
+    bool _swingOkS = nz(_sinceHigh, 0) >= swingBars
+    int _eL = (_rsiOkL or _patL or _swingOkL) ? 1 : 0
+    int _eS = (_rsiOkS or _patS or _swingOkS) ? 1 : 0
+    int _rL = _rsiOkL ? 1 : (_patL ? 2 : (_swingOkL ? 3 : 0))
+    int _rS = _rsiOkS ? 1 : (_patS ? 2 : (_swingOkS ? 3 : 0))
+    [_eL[off], _eS[off], _rL[off], _rS[off]]
+
+[exhLr, exhSr, exhReasonLr, exhReasonSr] = request.security(syminfo.tickerid, exhaustTF,
+     f_exhaustExpr(exhaustConfirmedOnly ? 1 : 0, exhRsiLen, exhRsiFlat, exhSwingLb,
+     exhSwingBars, pinMaxBody, pinMinWick),
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+exhaustLong  = nz(exhLr, 0) == 1
+exhaustShort = nz(exhSr, 0) == 1
+exhReasonL   = nz(exhReasonLr, 0)
+exhReasonS   = nz(exhReasonSr, 0)
 
 // ---------------------------------------------------------------- The veto ---
 // Score is zeroed BEFORE display, per spec - not merely hidden downstream.
