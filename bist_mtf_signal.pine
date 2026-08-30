@@ -1,0 +1,316 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// BIST Multi-Timeframe Buy/Sell Signal System
+// Conceptually inspired by SCALPTOOL R1.1 (JustUncleL) but written from scratch.
+// No ticker-specific hardcoding: every calculation derives from bar data or user inputs.
+//
+// ============================================================================
+//  BUILD STATUS
+// ============================================================================
+//  [x] Stage 1  Core layers 1-4 + simple total score          <-- CURRENT
+//  [ ] Stage 2  MTF architecture (1D lock + hard veto)
+//  [ ] Stage 3  1h entry timing + 15m exhaustion gate
+//  [ ] Stage 4  Mid-tier layers 6-8
+//  [ ] Stage 5  Advanced layers 9-13
+//  [ ] Stage 6  Cooldown + earnings blacklist
+//  [ ] Stage 7  Visuals (plotshape, colour coding, score label)
+//  [ ] Stage 8  Performance log panel
+//  [ ] Stage 9  Unified alertcondition()
+//  [ ] Stage 10 End-to-end / repaint testing
+//
+// ============================================================================
+//  request.security() CALL INVENTORY  (Stage 1)
+// ============================================================================
+//  COUNT: 0
+//  Stage 1 is computed entirely on the CHART timeframe. Heikin Ashi values are
+//  derived arithmetically from the chart's own real OHLC (see f_ha* below)
+//  rather than via request.security(ticker.heikinashi(...)), which:
+//    - saves a security call for the Stage 2-5 budget,
+//    - is inherently repaint-safe (no higher-TF lookahead involved),
+//    - keeps real OHLC available on the same bar for layers 9 & 11 later.
+//  Recommended chart timeframe: 4h (the spec's primary signal timeframe).
+//  Nothing here breaks on another TF; Stage 2 adds explicit MTF references.
+//
+// ============================================================================
+//  MIXED-CANDLE POLICY (enforced from Stage 1 onward)
+// ============================================================================
+//  Heikin Ashi (optional, default ON) : PAC channel, regime EMA ordering
+//  Real OHLC (always)                 : ADX, SMA50, RSI, MACD, volume
+//  Real OHLC (later, mandatory)       : layer 9 liquidity sweep, layer 11 candles
+// ============================================================================
+
+//@version=6
+indicator("BIST MTF Signal System", shorttitle = "BIST MTF", overlay = false, precision = 1, max_bars_back = 1000)
+// max_bars_back = 1000 covers the deepest Stage 1 lookback (slow EMA, default
+// 200, user-raisable toward the 600 discussed in the spec) plus PAC/pivot
+// warm-up headroom added in later stages.
+
+// ============================================================================
+//  INPUT GROUPS
+// ============================================================================
+const string G_GEN  = "General"
+const string G_SRC  = "Candle Source (Heikin Ashi / PAC)"
+const string G_L1   = "Layer 1 - Regime / Trend Filter"
+const string G_L2   = "Layer 2 - PAC Crossover"
+const string G_L3   = "Layer 3 - Momentum (RSI + MACD)"
+const string G_L4   = "Layer 4 - Volume Confirmation"
+const string G_DISP = "Display"
+
+// ---------------------------------------------------------------- General ---
+scoreThreshold = input.int(70, "Signal score threshold", minval = 1, maxval = 100, group = G_GEN,
+     tooltip = "Reference line only in Stage 1. Becomes the live signal trigger in Stage 9.")
+normalizeWeights = input.bool(true, "Renormalise score across ENABLED layers only", group = G_GEN,
+     tooltip = "WEIGHT REDISTRIBUTION: total design weight is 100 across all 13 layers. " +
+     "Stage 1 only ships layers 1-4 (55 of 100). With this ON the score is divided by the sum of " +
+     "enabled weights, so it always spans 0-100. With it OFF the raw weighted sum is shown, so " +
+     "disabling a layer removes its contribution WITHOUT redistributing it (max drops below 100).")
+
+// ----------------------------------------------------------- Candle source ---
+useHA = input.bool(true, "Use Heikin Ashi for PAC / EMA layers", group = G_SRC,
+     tooltip = "Affects ONLY the PAC channel and the regime EMA ordering. ADX, SMA50, RSI, MACD " +
+     "and volume always use real OHLC. Layers 9 and 11 will always use real OHLC.")
+pacLen = input.int(34, "PAC length (EMA of HA high/low/close)", minval = 1, group = G_SRC)
+
+// ---------------------------------------------------------------- Layer 1 ---
+useL1     = input.bool(true, "Enable Layer 1", group = G_L1)
+wL1       = input.float(20.0, "Weight", minval = 0.0, maxval = 100.0, step = 0.5, group = G_L1)
+adxLen    = input.int(14, "ADX / DI length", minval = 1, group = G_L1)
+adxSmooth = input.int(14, "ADX smoothing", minval = 1, group = G_L1)
+adxThr    = input.float(25.0, "ADX trend threshold", minval = 0.0, step = 0.5, group = G_L1)
+smaLen    = input.int(50, "SMA length (price vs SMA)", minval = 1, group = G_L1)
+emaFastLen = input.int(34,  "EMA fast",   minval = 1, group = G_L1)
+emaMedLen  = input.int(89,  "EMA medium", minval = 1, group = G_L1)
+emaSlowLen = input.int(200, "EMA slow",   minval = 1, group = G_L1)
+
+// ---------------------------------------------------------------- Layer 2 ---
+useL2 = input.bool(true, "Enable Layer 2", group = G_L2)
+wL2   = input.float(10.0, "Weight", minval = 0.0, maxval = 100.0, step = 0.5, group = G_L2)
+pacDipBars = input.int(10, "PAC-mid pullback lookback (N bars)", minval = 1, maxval = 200, group = G_L2,
+     tooltip = "Long: price must have closed BELOW PAC-mid within the last N bars. Short: mirrored.")
+
+// ---------------------------------------------------------------- Layer 3 ---
+useL3 = input.bool(true, "Enable Layer 3", group = G_L3)
+wL3   = input.float(15.0, "Weight", minval = 0.0, maxval = 100.0, step = 0.5, group = G_L3)
+rsiLen       = input.int(14, "RSI length",             minval = 1, group = G_L3)
+rsiSmoothLen = input.int(9,  "RSI smoothing (SMA)",    minval = 1, group = G_L3)
+macdFastLen  = input.int(12, "MACD fast",              minval = 1, group = G_L3)
+macdSlowLen  = input.int(26, "MACD slow",              minval = 1, group = G_L3)
+macdSigLen   = input.int(9,  "MACD signal",            minval = 1, group = G_L3)
+
+// ---------------------------------------------------------------- Layer 4 ---
+useL4 = input.bool(true, "Enable Layer 4", group = G_L4)
+wL4   = input.float(10.0, "Weight", minval = 0.0, maxval = 100.0, step = 0.5, group = G_L4)
+volLen     = input.int(20, "Volume SMA length", minval = 1, group = G_L4)
+volRatioLo = input.float(0.5, "Low anchor: vol / avg",  minval = 0.0, step = 0.1, group = G_L4)
+volConfLo  = input.float(0.2, "Low anchor: confidence", minval = 0.0, maxval = 1.0, step = 0.05, group = G_L4)
+volRatioHi = input.float(2.0, "High anchor: vol / avg", minval = 0.1, step = 0.1, group = G_L4)
+volConfHi  = input.float(1.0, "High anchor: confidence", minval = 0.0, maxval = 1.0, step = 0.05, group = G_L4)
+
+// ---------------------------------------------------------------- Display ---
+showComponents = input.bool(false, "Plot long / short component scores", group = G_DISP)
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+
+// Clamp v into [lo, hi]. na in -> na out (callers guard before calling).
+f_clamp(float v, float lo, float hi) =>
+    math.max(lo, math.min(hi, v))
+
+// ============================================================================
+//  HEIKIN ASHI (computed from this chart's real OHLC - no security call)
+// ============================================================================
+haClose = (open + high + low + close) / 4.0
+var float haOpen = na
+haOpen := na(haOpen[1]) ? (open + close) / 2.0 : (haOpen[1] + haClose[1]) / 2.0
+haHigh = math.max(high, math.max(haOpen, haClose))
+haLow  = math.min(low,  math.min(haOpen, haClose))
+
+// Source selector for PAC / EMA layers only.
+srcOpen  = useHA ? haOpen  : open
+srcClose = useHA ? haClose : close
+srcHigh  = useHA ? haHigh  : high
+srcLow   = useHA ? haLow   : low
+
+// ============================================================================
+//  SHARED INDICATOR SERIES
+//  Computed once at global scope and passed into the scoring functions as
+//  parameters. This keeps every f_*Score() a PURE function (no ta.* calls in
+//  conditional branches, no hidden state), so each layer can be called twice
+//  - once for the long hypothesis, once for the short - and unit-tested in
+//  isolation by feeding it fixed values.
+// ============================================================================
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxSmooth)   // real OHLC
+smaVal  = ta.sma(close, smaLen)                          // real OHLC
+emaFast = ta.ema(srcClose, emaFastLen)                   // HA-aware
+emaMed  = ta.ema(srcClose, emaMedLen)                    // HA-aware
+emaSlow = ta.ema(srcClose, emaSlowLen)                   // HA-aware
+
+pacUpper = ta.ema(srcHigh,  pacLen)                      // HA-aware
+pacLower = ta.ema(srcLow,   pacLen)                      // HA-aware
+pacMid   = ta.ema(srcClose, pacLen)                      // HA-aware
+
+rsiVal   = ta.rsi(close, rsiLen)                         // real OHLC
+rsiMaVal = ta.sma(rsiVal, rsiSmoothLen)
+[macdLine, macdSigLine, macdHist] = ta.macd(close, macdFastLen, macdSlowLen, macdSigLen)
+
+volAvg = ta.sma(volume, volLen)                          // real volume
+
+// ============================================================================
+//  LAYER 1 - REGIME / TREND FILTER            (design weight 20)
+//  confidence = (# of met sub-conditions) / 3
+//    a) ADX(len) > threshold                   (non-directional)
+//    b) close vs SMA(50)                       (directional, real OHLC)
+//    c) EMA ordering fast > med > slow         (directional, HA-aware)
+//  NA GUARD: during warm-up on a newly listed / short-history ticker any of
+//  smaVal / emaSlow is na -> return neutral 0.5 rather than na or 0.
+// ============================================================================
+f_regimeScore(int dir, float adxv, float adxThreshold, float px, float sma, float eFast, float eMed, float eSlow) =>
+    float res = 0.5
+    if na(adxv) or na(px) or na(sma) or na(eFast) or na(eMed) or na(eSlow)
+        res := 0.5
+    else
+        bool cAdx = adxv > adxThreshold
+        bool cSma = dir > 0 ? px > sma : px < sma
+        bool cEma = dir > 0 ? (eFast > eMed and eMed > eSlow) : (eFast < eMed and eMed < eSlow)
+        res := ((cAdx ? 1.0 : 0.0) + (cSma ? 1.0 : 0.0) + (cEma ? 1.0 : 0.0)) / 3.0
+    res
+
+// ============================================================================
+//  LAYER 2 - PAC CROSSOVER                     (design weight 10)
+//  LONG : HA_open < PAC_upper AND HA_close > PAC_upper   -> fresh breakout 0.70
+//         already trading above PAC_upper (no fresh cross) -> 0.35
+//         PLUS closed below PAC_mid within last N bars     -> +0.30
+//  SHORT: mirrored on PAC_lower / above PAC_mid.
+//  Result clamped to [0, 1].
+//  ta.barssince() is evaluated UNCONDITIONALLY at the top of the function for
+//  both directions so no ta.* call ever sits inside an if-branch.
+// ============================================================================
+f_pacScore(int dir, float o, float c, float pUp, float pLo, float pMid, int dipBars) =>
+    int barsSinceBelowMid = ta.barssince(c < pMid)
+    int barsSinceAboveMid = ta.barssince(c > pMid)
+    float res = 0.5
+    if na(pUp) or na(pLo) or na(pMid) or na(o) or na(c)
+        res := 0.5
+    else
+        float sc = 0.0
+        if dir > 0
+            bool fresh = o < pUp and c > pUp
+            sc := fresh ? 0.7 : (c > pUp ? 0.35 : 0.0)
+            bool pulled = not na(barsSinceBelowMid) and barsSinceBelowMid <= dipBars
+            sc := sc + (pulled ? 0.3 : 0.0)
+        else
+            bool fresh = o > pLo and c < pLo
+            sc := fresh ? 0.7 : (c < pLo ? 0.35 : 0.0)
+            bool pulled = not na(barsSinceAboveMid) and barsSinceAboveMid <= dipBars
+            sc := sc + (pulled ? 0.3 : 0.0)
+        res := f_clamp(sc, 0.0, 1.0)
+    res
+
+// ============================================================================
+//  LAYER 3 - MOMENTUM (RSI cross + MACD histogram)   (design weight 15)
+//  0.5 sub-weight: RSI vs its smoothing line
+//        fresh cross in signal direction -> 0.50 ; merely on the right side -> 0.25
+//  0.5 sub-weight: MACD histogram direction CHANGE
+//        turning bar (slope flips into signal direction) -> 0.50 ; still
+//        moving in the right direction -> 0.25
+//  NA GUARD: needs hist[2]; during warm-up -> neutral 0.5.
+// ============================================================================
+f_momentumScore(int dir, float rsi, float rsiMa, float hist) =>
+    float res = 0.5
+    if na(rsi) or na(rsiMa) or na(rsi[1]) or na(rsiMa[1]) or na(hist) or na(hist[1]) or na(hist[2])
+        res := 0.5
+    else
+        bool rsiCrossUp   = rsi > rsiMa and rsi[1] <= rsiMa[1]
+        bool rsiCrossDown = rsi < rsiMa and rsi[1] >= rsiMa[1]
+        bool histTurnUp   = hist > hist[1] and hist[1] <= hist[2]
+        bool histTurnDown = hist < hist[1] and hist[1] >= hist[2]
+        float rsiPart  = 0.0
+        float macdPart = 0.0
+        if dir > 0
+            rsiPart  := rsiCrossUp   ? 0.5 : (rsi > rsiMa    ? 0.25 : 0.0)
+            macdPart := histTurnUp   ? 0.5 : (hist > hist[1] ? 0.25 : 0.0)
+        else
+            rsiPart  := rsiCrossDown ? 0.5 : (rsi < rsiMa    ? 0.25 : 0.0)
+            macdPart := histTurnDown ? 0.5 : (hist < hist[1] ? 0.25 : 0.0)
+        res := f_clamp(rsiPart + macdPart, 0.0, 1.0)
+    res
+
+// ============================================================================
+//  LAYER 4 - VOLUME CONFIRMATION               (design weight 10)
+//  ratio = volume / SMA(volume, 20), mapped linearly through two anchors
+//  (default 0.5x -> 0.20 and 2.0x -> 1.00), clamped to [0, 1].
+//  Non-directional: identical confidence for the long and short hypothesis.
+//  DIV-BY-ZERO GUARD: volAvg na or <= 0 (illiquid / no-trade bar, or a feed
+//  that reports zero volume) -> neutral 0.5.
+//  Also guards against the user setting hi anchor == lo anchor.
+// ============================================================================
+f_volumeScore(float vol, float avg, float rLo, float cLo, float rHi, float cHi) =>
+    float res = 0.5
+    if na(vol) or na(avg) or avg <= 0.0 or math.abs(rHi - rLo) < 1e-10
+        res := 0.5
+    else
+        float ratio = vol / avg
+        float slope = (cHi - cLo) / (rHi - rLo)
+        res := f_clamp(cLo + (ratio - rLo) * slope, 0.0, 1.0)
+    res
+
+// ============================================================================
+//  SCORE AGGREGATION
+//  Both hypotheses are scored every bar; the stronger one becomes the
+//  candidate direction. Layers 1-4 are computed unconditionally (keeps ta.*
+//  out of conditionals); the enable toggles act at aggregation time.
+// ============================================================================
+s1Long  = f_regimeScore( 1, adxVal, adxThr, close, smaVal, emaFast, emaMed, emaSlow)
+s1Short = f_regimeScore(-1, adxVal, adxThr, close, smaVal, emaFast, emaMed, emaSlow)
+
+s2Long  = f_pacScore( 1, srcOpen, srcClose, pacUpper, pacLower, pacMid, pacDipBars)
+s2Short = f_pacScore(-1, srcOpen, srcClose, pacUpper, pacLower, pacMid, pacDipBars)
+
+s3Long  = f_momentumScore( 1, rsiVal, rsiMaVal, macdHist)
+s3Short = f_momentumScore(-1, rsiVal, rsiMaVal, macdHist)
+
+s4Both  = f_volumeScore(volume, volAvg, volRatioLo, volConfLo, volRatioHi, volConfHi)
+
+f_aggregate(float c1, float c2, float c3, float c4) =>
+    float num = 0.0
+    float den = 0.0
+    if useL1
+        num += c1 * wL1
+        den += wL1
+    if useL2
+        num += c2 * wL2
+        den += wL2
+    if useL3
+        num += c3 * wL3
+        den += wL3
+    if useL4
+        num += c4 * wL4
+        den += wL4
+    float outv = 0.0
+    if normalizeWeights
+        outv := den > 0.0 ? num / den * 100.0 : 0.0
+    else
+        outv := num
+    f_clamp(outv, 0.0, 100.0)
+
+longScore  = f_aggregate(s1Long,  s2Long,  s3Long,  s4Both)
+shortScore = f_aggregate(s1Short, s2Short, s3Short, s4Both)
+
+// Candidate direction: +1 long, -1 short, 0 tie/flat.
+// Stage 2 overlays the 1D hard veto on top of this.
+sigDir     = longScore > shortScore ? 1 : (shortScore > longScore ? -1 : 0)
+totalScore = math.max(longScore, shortScore)
+
+// ============================================================================
+//  PLOTS  (Stage 1: minimal, plot()/hline() only - no plotshape, no colour
+//          coding of signals; that arrives in Stage 7)
+// ============================================================================
+plot(totalScore, "Total Score", color = color.new(color.gray, 0), linewidth = 2)
+plot(showComponents ? longScore  : na, "Long Score",  color = color.new(color.teal,   35))
+plot(showComponents ? shortScore : na, "Short Score", color = color.new(color.maroon, 35))
+
+hline(scoreThreshold, "Threshold", color = color.new(color.gray, 40), linestyle = hline.style_dashed)
+hline(80, "Band 80", color = color.new(color.gray, 80), linestyle = hline.style_dotted)
+hline(60, "Band 60", color = color.new(color.gray, 80), linestyle = hline.style_dotted)
+hline(40, "Band 40", color = color.new(color.gray, 80), linestyle = hline.style_dotted)
+hline(0,  "Zero",    color = color.new(color.gray, 70))
