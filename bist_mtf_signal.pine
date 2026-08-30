@@ -158,6 +158,8 @@ dEmaSlowLen = input.int(200, "1D EMA slow",    minval = 1, group = G_L5)
 
 // ---------------------------------------------------------------- Display ---
 showComponents = input.bool(false, "Plot long / short component scores", group = G_DISP)
+showRawScore   = input.bool(false, "Plot raw pre-veto score", group = G_DISP)
+showBias       = input.bool(false, "Plot 1D bias (0 short / 50 neutral / 100 long)", group = G_DISP)
 
 // ============================================================================
 //  HELPERS
@@ -348,9 +350,8 @@ longScore  = f_aggregate(s1Long,  s2Long,  s3Long,  s4Both)
 shortScore = f_aggregate(s1Short, s2Short, s3Short, s4Both)
 
 // Candidate direction: +1 long, -1 short, 0 tie/flat.
-// Stage 2 overlays the 1D hard veto on top of this.
-sigDir     = longScore > shortScore ? 1 : (shortScore > longScore ? -1 : 0)
-totalScore = math.max(longScore, shortScore)
+sigDir  = longScore > shortScore ? 1 : (shortScore > longScore ? -1 : 0)
+rawScore = math.max(longScore, shortScore)
 
 // ============================================================================
 //  LAYER 5 - MTF DIRECTIONAL LOCK (1D)          HARD VETO, NOT WEIGHTED
@@ -403,13 +404,23 @@ f_dailyBiasExpr(simple int off) =>
 // nz guard: before the first bias bar resolves the tuple is na -> neutral.
 dBias = nz(dBiasRaw, 0)
 
+// ---------------------------------------------------------------- The veto ---
+// Score is zeroed BEFORE display, per spec - not merely hidden downstream.
+biasLocked = dBias != 0
+vetoPassed = not useVeto or (biasLocked and sigDir != 0 and sigDir == dBias)
+totalScore = vetoPassed ? rawScore : 0.0
+finalDir   = vetoPassed ? sigDir   : 0
+
 // ============================================================================
-//  PLOTS  (Stage 1: minimal, plot()/hline() only - no plotshape, no colour
+//  PLOTS  (minimal, plot()/hline() only - no plotshape, no colour
 //          coding of signals; that arrives in Stage 7)
 // ============================================================================
 plot(totalScore, "Total Score", color = color.new(color.gray, 0), linewidth = 2)
+plot(showRawScore   ? rawScore   : na, "Raw Score (pre-veto)", color = color.new(color.gray, 60))
 plot(showComponents ? longScore  : na, "Long Score",  color = color.new(color.teal,   35))
 plot(showComponents ? shortScore : na, "Short Score", color = color.new(color.maroon, 35))
+plot(showBias ? (dBias + 1) * 50 : na, "1D Bias", color = color.new(color.orange, 40),
+     style = plot.style_stepline)
 
 hline(scoreThreshold, "Threshold", color = color.new(color.gray, 40), linestyle = hline.style_dashed)
 hline(80, "Band 80", color = color.new(color.gray, 80), linestyle = hline.style_dotted)
