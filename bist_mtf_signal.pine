@@ -524,15 +524,28 @@ kapDate3 = input.time(KAP_UNSET, "Earnings / KAP date 3", group = G_KAP)
 kapDate4 = input.time(KAP_UNSET, "Earnings / KAP date 4", group = G_KAP)
 
 // ---------------------------------------------------------------- Display ---
-showComponents = input.bool(false, "Plot long / short component scores", group = G_DISP)
-showRawScore   = input.bool(false, "Plot raw pre-veto score", group = G_DISP)
-showBias       = input.bool(false, "Plot 1D bias (0 short / 50 neutral / 100 long)", group = G_DISP)
-showRisk       = input.bool(false, "Plot earnings / KAP risk flag", group = G_DISP,
-     tooltip = "Stepped trace at 110 while a bar sits inside a flagged window. Stage 7 replaces " +
-     "it with proper on-chart highlighting.")
-showGates      = input.bool(false, "Plot entry / exhaustion gate states", group = G_DISP,
-     tooltip = "Stepped debug traces: score armed (30), entry ready (60), entry signal (90). " +
-     "Replaced by proper markers in Stage 7.")
+// TWO MASTER SWITCHES, per spec. Everything a trader acts on sits under the
+// first; everything that exists only to explain WHY sits under the second.
+// They are independent: you can run the indicator clean, run it as a
+// diagnostic with no markers, or both at once.
+showEntrySignals = input.bool(true, "Show entry signals", group = G_DISP,
+     tooltip = "Entry markers on the price chart, the colour-coded score line and the score label. " +
+     "Turn OFF for a bare score pane.")
+showDebugLayers = input.bool(false, "Show debug layers", group = G_DISP,
+     tooltip = "MASTER SWITCH for every diagnostic trace below. With it off, none of them draw no " +
+     "matter how their individual switches are set - so you can leave those configured and flip " +
+     "the whole diagnostic view on and off with one click.")
+
+// -- Individual debug traces. Each ALSO requires the master switch above. ----
+showComponents = input.bool(false, "Debug: long / short component scores", group = G_DISP)
+showRawScore   = input.bool(false, "Debug: raw pre-veto score", group = G_DISP)
+showBias       = input.bool(false, "Debug: 1D bias (0 short / 50 neutral / 100 long)",
+     group = G_DISP)
+showRisk       = input.bool(true, "Debug: earnings / KAP risk shading", group = G_DISP,
+     tooltip = "Tints the score pane while a bar sits inside a flagged window.")
+showGates      = input.bool(false, "Debug: entry / exhaustion gate states", group = G_DISP,
+     tooltip = "Stepped traces: score armed (30), entry ready (60), entry signal (90), cooldown " +
+     "blocked (100). The stack shows exactly which gate a setup died at.")
 
 // ============================================================================
 //  HELPERS
@@ -1584,29 +1597,62 @@ if entrySignalFresh and finalDir != 0
     array.set(cdLastSignalBar, finalDir > 0 ? 0 : 1, bar_index)
 
 // ============================================================================
-//  PLOTS  (minimal, plot()/hline() only - no plotshape, no colour
-//          coding of signals; that arrives in Stage 7)
+//  VISUALS (Stage 7)
 // ============================================================================
-plot(totalScore, "Total Score", color = color.new(color.gray, 0), linewidth = 2)
-plot(showRawScore   ? rawScore   : na, "Raw Score (pre-veto)", color = color.new(color.gray, 60))
-plot(showComponents ? longScore  : na, "Long Score",  color = color.new(color.teal,   35))
-plot(showComponents ? shortScore : na, "Short Score", color = color.new(color.maroon, 35))
-plot(showBias ? (dBias + 1) * 50 : na, "1D Bias", color = color.new(color.orange, 40),
+//  Colour convention used everywhere below, so one glance reads the same way
+//  in the pane and on the price chart:
+//      teal   = long        maroon = short        gray = no direction
+//  Hue carries DIRECTION. Opacity carries CONVICTION - a 45-score long and an
+//  85-score long are the same colour at different strengths, so score bands
+//  are legible without reading the number.
+// ============================================================================
+
+// A debug trace draws only when its own switch AND the master switch are on.
+dbgComponents = showDebugLayers and showComponents
+dbgRawScore   = showDebugLayers and showRawScore
+dbgBias       = showDebugLayers and showBias
+dbgRisk       = showDebugLayers and showRisk
+dbgGates      = showDebugLayers and showGates
+
+f_dirColor(int dir) =>
+    dir > 0 ? color.teal : (dir < 0 ? color.maroon : color.gray)
+
+// Band -> transparency. The 80 / 60 / 40 cuts are the same bands the Stage 8
+// performance panel will report win rates against, so the eye and the table
+// agree on what "a strong signal" means.
+f_scoreColor(int dir, float score) =>
+    int transp = score >= 80 ? 0 : (score >= 60 ? 25 : (score >= 40 ? 50 : 70))
+    color.new(f_dirColor(dir), transp)
+
+// ---------------------------------------------------------- The score line ---
+pScore = plot(totalScore, "Total Score", color = f_scoreColor(finalDir, totalScore), linewidth = 2)
+pZero  = plot(0, "Zero base", color = color.new(color.gray, 100), display = display.none)
+fill(pScore, pZero, color = color.new(f_dirColor(finalDir), 88), title = "Score fill")
+
+// ------------------------------------------------------------ Debug traces ---
+plot(dbgRawScore   ? rawScore   : na, "Debug: Raw Score (pre-veto)",
+     color = color.new(color.gray, 60))
+plot(dbgComponents ? longScore  : na, "Debug: Long Score",  color = color.new(color.teal,   35))
+plot(dbgComponents ? shortScore : na, "Debug: Short Score", color = color.new(color.maroon, 35))
+plot(dbgBias ? (dBias + 1) * 50 : na, "Debug: 1D Bias", color = color.new(color.orange, 40),
      style = plot.style_stepline)
 
-// Gate traces: stacked so the three stages are distinguishable at a glance.
-plot(showGates and scoreArmed  ? 30 : na, "Score Armed", color = color.new(color.blue, 50),
+// Gate traces: stacked so the stages are distinguishable at a glance, and so
+// the height the trace reaches tells you which gate a setup died at.
+plot(dbgGates and scoreArmed  ? 30 : na, "Debug: Score Armed", color = color.new(color.blue, 50),
      style = plot.style_stepline)
-plot(showGates and entryReady  ? 60 : na, "Entry Ready", color = color.new(color.purple, 30),
+plot(dbgGates and entryReady  ? 60 : na, "Debug: Entry Ready", color = color.new(color.purple, 30),
      style = plot.style_stepline)
-plot(showGates and entrySignal ? 90 : na, "Entry Signal", color = color.new(color.fuchsia, 10),
-     style = plot.style_stepline)
-plot(showGates and cooldownBlocked ? 100 : na, "Cooldown Blocked",
+plot(dbgGates and entrySignal ? 90 : na, "Debug: Entry Signal",
+     color = color.new(color.fuchsia, 10), style = plot.style_stepline)
+plot(dbgGates and cooldownBlocked ? 100 : na, "Debug: Cooldown Blocked",
      color = color.new(color.red, 0), style = plot.style_stepline)
 
-// Risk flag rides above the gate traces: it annotates them, it does not gate.
-plot(showRisk and earningsRisk ? 110 : na, "Earnings Risk",
-     color = color.new(color.yellow, 0), style = plot.style_stepline)
+// Earnings / KAP risk as a pane tint rather than a trace: it annotates every
+// gate at once and costs no vertical space. Still purely informational - it
+// does not touch the score and cannot suppress a signal.
+bgcolor(dbgRisk and earningsRisk ? color.new(color.yellow, 90) : na,
+     title = "Debug: Earnings risk window")
 
 hline(scoreThreshold, "Threshold", color = color.new(color.gray, 40), linestyle = hline.style_dashed)
 hline(80, "Band 80", color = color.new(color.gray, 80), linestyle = hline.style_dotted)
