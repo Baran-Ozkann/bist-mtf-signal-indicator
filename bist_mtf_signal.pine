@@ -579,11 +579,12 @@ exitGapFill = input.bool(true, "Gap through the stop fills at the bar open", gro
      "only: crediting the same price improvement on a target would flatter the result.")
 
 useE3 = input.bool(false, "E3 - trailing stop", group = G_EXIT,
-     tooltip = "OFF - MEASURED, NOT ASSUMED. Tested across six tickers at 3.0 and 5.0 ATR and it " +
-     "reduced average R on four of the five that had comparable readings. It exits on ordinary " +
-     "pullbacks and gives up more than it protects. See the E3 section of " +
-     "stage_8_5_exit_logic.md before turning it back on - the reasoning that it is the only rule " +
-     "able to HOLD a position is sound and still wrong in practice.\n\n" +
+     tooltip = "OFF - MEASURED, NOT ASSUMED. The trail is not a bad rule on its own; it scores " +
+     "respectably in isolation. It loses money by DISPLACEMENT: it fires first on bars where E4 " +
+     "score decay would also have triggered, and because a trail sits a fixed distance under the " +
+     "high-water mark, the trades it intercepts are disproportionately the biggest winners. On " +
+     "TOASO it cut E4 from a 16% share at +8.08 average R to 4% at +1.95. Read the E3 section of " +
+     "stage_8_5_exit_logic.md before turning it back on.\n\n" +
      "Available to both models when enabled. On the structural track it is the trailing FLOOR, " +
      "with E4-E7 live as early-exit overrides. Note it is shared, so enabling it also turns the " +
      "fixed-R model from a two-rule stop-and-target into a three-rule one, and fixed-R numbers " +
@@ -1993,12 +1994,20 @@ cooldownBlocked = entryFreshRaw and not cooldownClear
 // On the structural track E3 is the trailing FLOOR: E4 to E7 remain live and
 // close the position first whenever the case for it dissolves.
 //
-// E3 SHIPS DISABLED ANYWAY. The argument above is sound and it still lost
-// money: measured across six tickers at 3.0 and 5.0 ATR, enabling the trail
-// reduced average R on four of the five with comparable readings. It exits on
-// ordinary pullbacks and gives up more than it protects. The plumbing stays
-// because the reasoning is worth being able to re-test, not because the rule
-// earned its place. See stage_8_5_exit_logic.md before re-enabling it.
+// E3 SHIPS DISABLED ANYWAY, and the reason is subtler than the trail being a
+// poor rule - in isolation it scores respectably. It loses money by
+// DISPLACEMENT. Price levels resolve before state rules, so on any bar where
+// both the trail and E4 score decay would fire, the trail wins. And because a
+// trail sits a fixed distance below the high-water mark, the longer a
+// position runs the more certain it becomes that some pullback reaches it -
+// so the trades it intercepts are disproportionately the biggest winners, the
+// ones E4 was holding for. Measured on TOASO: E4 fell from a 16% share at
+// +8.08 average R to 4% at +1.95.
+//
+// This is NOT fixable by resolving the structural rules first. The trail is
+// tested against the bar's low and is therefore hit intrabar, while E4 is only
+// final at the close; a position cannot un-hit a stop that already filled.
+// The ordering reflects real execution. See stage_8_5_exit_logic.md.
 liveStructural = exitLiveModelStr == "Structural"
 liveE1 = useE1
 liveE2 = useE2 and not liveStructural

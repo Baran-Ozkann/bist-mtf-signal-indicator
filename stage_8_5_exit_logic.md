@@ -123,7 +123,8 @@ Notes on individual rules:
   `tMfe > (trailATR - stopATR) x atr`. It reaches breakeven at
   `tMfe = trailATR x atr` and locks in X R at `tMfe = (trailATR + X) x atr`.
 
-  **Tested and rejected — see §13. E3 ships disabled.**
+  **Tested and rejected — see §12. E3 ships disabled.** Not because the trail
+  is a poor rule, but because it pre-empts a better one.
 - **E4** reads the **pre-veto directional** score. The post-veto score is
   zeroed whenever the daily bias goes neutral, so using it would fire E4 on
   every neutral daily bar — duplicating E5, far more often, and for a reason
@@ -321,40 +322,66 @@ available to both tracks.
 
 ### What was measured
 
-Average R per signal, structural model, six tickers:
+Clean retest: stop held at 1.0 ATR in both runs, 4h charts, n=25 each, only
+`useE3` varied. Average R per signal, structural model:
 
-| Ticker | E3 off, stop 1.0 | E3 on, stop 2.0 |
-|---|---|---|
-| TAVHL | +1.18 | — |
-| BIMAS | +0.56 | +0.21 |
-| TOASO | +1.48 | +0.36 |
-| ULKER | +0.63 | +0.73 |
-| TUPRS | +0.15 | +0.14 |
-| GARAN | +0.47 | +0.20 |
+| Ticker | E3 off | E3 on | delta |
+|---|---|---|---|
+| BIMAS | +0.74 | +0.78 | +0.04 |
+| TOASO | +0.99 | +0.26 | **−0.73** |
 
-Of the five with comparable readings, three are clearly worse, one is a wash
-and one (ULKER) is marginally better. Across those five the summed average R
-falls from +3.29 to +1.64. Widening the trail from 3.0 to 5.0 ATR did not
-help, so the problem is not the width: the trail exits on ordinary pullbacks
-and gives up more than it protects.
+The `HORIZON` control row stayed flat across both runs — BIMAS +0.52/+0.48,
+TOASO +0.71/+0.58. That track applies no exit rule at all, so its stability
+rules out the R-denominator artefact that made the first, confounded run
+unreadable. The effect is real.
 
-### The caveat, which matters if this is ever re-tested
+*(An earlier run varied stop width alongside `useE3` and is not reproduced
+here; it measured a much larger apparent cost, most of which was the
+denominator. It should not be cited.)*
 
-**The two runs differed in two variables, not one.** The E3-on column also
-used a 2.0 ATR hard stop rather than 1.0. Since `1R = exitStopATR x atrAt`,
-doubling the stop doubles the R denominator and mechanically halves every
-R-multiple for identical price behaviour. Several of the observed drops are
-close to exactly half, which is what that confound would produce on its own.
+### The mechanism: displacement, not destruction
 
-The revert is right regardless — E3 off with a 1.0 stop is the best
-configuration measured — but the *attribution* to the trail is not clean.
+**The trail is not a bad rule in isolation.** On TOASO it took a 28% share of
+exits at +3.00 average R. That is a perfectly respectable rule.
 
-**A clean retest** would hold `exitStopATR` fixed at 1.0 and vary only
-`useE3`. The confirming check on the existing runs is the `HORIZON` row of
-the panel's exit-model comparison: it applies no exit rule at all, so it
-cannot be affected by the trail. If it also roughly halved between the two
-runs, the denominator explains most of the movement and E3's real cost is
-smaller than the table above suggests.
+The damage is to what it pre-empts. On the same ticker, E4 (score decay) went
+from a 16% share at **+8.08** average R down to a 4% share at **+1.95**.
+
+Two things happened there, and the second is the important one:
+
+1. E4's *share* collapsed — the trail fired first on bars where both would
+   have triggered.
+2. E4's *average R* collapsed with it, from +8.08 to +1.95. The trail did not
+   take a random sample of E4's trades. It took the best ones.
+
+That second point is the whole finding. A trail sits a fixed distance below
+the high-water mark, so the longer and further a position runs, the more
+certain it becomes that some pullback eventually touches it. The biggest
+winners are therefore the trades most likely to be intercepted before their
+thesis actually decays. E3 systematically harvests exactly the trades E4 was
+holding for.
+
+BIMAS shows the same displacement, but E4 and E3 perform similarly on that
+symbol, so it nets out to +0.04. **The cost of E3 is therefore a function of
+how much better E4 is on a given name** — which makes it symbol-dependent,
+and two tickers at n=25 cannot settle its size.
+
+### Why this is not fixable by reordering the rules
+
+The obvious response is to let the structural rules resolve before the trail.
+That would be wrong. The trail is tested against the bar's low, so it is hit
+*intrabar*; E4 depends on the score, which is only final at the close. On a
+bar where both trigger, the trail genuinely was touched first, and a position
+cannot un-hit a stop that has already filled. The current order reflects real
+execution rather than an arbitrary preference.
+
+### What remains untested
+
+A trail wide enough not to compete with E4 — well beyond 3.0 ATR — might add
+value as a pure catastrophe floor rather than as an exit rule, catching only
+the collapses that E4 is too slow for. 5.0 ATR was tried once, in the
+confounded run, so it has not really been measured. This is a hypothesis, not
+a recommendation.
 
 ---
 
