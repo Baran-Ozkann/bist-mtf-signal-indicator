@@ -680,6 +680,23 @@ type SigRec
     float mae         // max adverse excursion so far, price units
     float ret         // return at the horizon, percent - na while pending
     bool  resolved    // horizon reached, ret is final
+    // --- track A, fixed-R: E1 stop, E2 target, optional E3 trail, E8 ------
+    float fR          // outcome in R - na while this track is still open
+    int   fReason     // exit reason code
+    int   fBars       // bars held
+    bool  fDone
+    // --- track B, structural: E1 stop as a floor, then E4-E7, E8 ----------
+    float sR
+    int   sReason
+    int   sBars
+    bool  sDone
+
+// Result of one exit test. An object rather than a tuple because Pine only
+// destructures tuples in the global scope, and the per-signal simulation has
+// to run these tests inside a loop.
+type ExitRes
+    int   reason
+    float fill
 
 // ============================================================================
 //  HELPERS
@@ -1785,11 +1802,10 @@ f_exitName(int reason) =>
 //
 // Pure, so the live position and the per-signal simulation in 8.5c share one
 // implementation and cannot drift apart.
-// Returns [reason, fill]. A flat direction or missing levels return no exit.
+// A flat direction or missing levels return reason EXIT_NONE.
 f_fixedExit(int dir, float stop, float trail, float target, bool eStop, bool eTrail,
      bool eTarget, bool stopFirst, bool gapFill, float o, float h, float l) =>
-    int reason = EXIT_NONE
-    float fill = na
+    ExitRes res = ExitRes.new(EXIT_NONE, na)
     if dir != 0
         bool hitStop   = eStop   and not na(stop)   and (dir > 0 ? l <= stop   : h >= stop)
         bool hitTrail  = eTrail  and not na(trail)  and (dir > 0 ? l <= trail  : h >= trail)
@@ -1797,15 +1813,15 @@ f_fixedExit(int dir, float stop, float trail, float target, bool eStop, bool eTr
         if (hitStop or hitTrail) and (not hitTarget or stopFirst)
             // A bar that opened beyond the level never offered the level.
             if hitStop
-                reason := EXIT_STOP
-                fill := gapFill ? (dir > 0 ? math.min(stop, o) : math.max(stop, o)) : stop
+                res.reason := EXIT_STOP
+                res.fill := gapFill ? (dir > 0 ? math.min(stop, o) : math.max(stop, o)) : stop
             else
-                reason := EXIT_TRAIL
-                fill := gapFill ? (dir > 0 ? math.min(trail, o) : math.max(trail, o)) : trail
+                res.reason := EXIT_TRAIL
+                res.fill := gapFill ? (dir > 0 ? math.min(trail, o) : math.max(trail, o)) : trail
         else if hitTarget
-            reason := EXIT_TARGET
-            fill := target
-    [reason, fill]
+            res.reason := EXIT_TARGET
+            res.fill := target
+    res
 
 // STATE exits: E4 score decay, E5 bias flip, E6 PAC cross, E7 opposite signal,
 // E8 time stop. These resolve against the state of the system rather than a
@@ -1837,6 +1853,28 @@ f_structExit(int dir, int age, bool eScore, int decayBars, int decayNeed,
         else if eTime and age >= maxBars
             reason := EXIT_TIME
     reason
+
+// THE combiner. Price levels first, then state rules filling at the close.
+// Three callers - the live position and both simulated tracks - so a model is
+// defined entirely by the enable flags handed to it and the live path cannot
+// behave differently from the path that measures it.
+//
+// The parameter list is long on purpose: every input is passed in rather than
+// read from globals, so the same call resolves a record that fired 300 bars
+// ago as correctly as it resolves the position open right now.
+f_modelExit(int dir, int age, float stop, float trail, float target,
+     bool e1, bool e3, bool e2, bool e4, bool e5, bool e6, bool e7, bool e8,
+     int decayBars, int decayNeed, int bias, float src, float pacLine, bool oppSig,
+     int maxBars, bool stopFirst, bool gapFill,
+     float o, float h, float l, float c) =>
+    ExitRes res = f_fixedExit(dir, stop, trail, target, e1, e3, e2, stopFirst, gapFill, o, h, l)
+    if res.reason == EXIT_NONE
+        int st = f_structExit(dir, age, e4, decayBars, decayNeed, e5, bias, e6, src, pacLine,
+             e7, oppSig, e8, maxBars)
+        if st != EXIT_NONE
+            res.reason := st
+            res.fill := c
+    res
 
 // ============================================================================
 //  SIGNAL ASSEMBLY - four sequential gates
@@ -1926,12 +1964,11 @@ posTrail = posDir == 0 or na(posAtr) or na(posEntry) ? na :
 
 // Evaluated unconditionally at global scope - never inside a branch. The
 // guards below decide whether the verdict is acted on. When flat, posDir is 0
-// and both functions return no exit.
-[fxReason, fxFill] = f_fixedExit(posDir, posStop, posTrail, posTarget, liveE1, liveE3, liveE2,
-     exitStopFirst, exitGapFill, open, high, low)
-stReason = f_structExit(posDir, na(posBar) ? 0 : bar_index - posBar, liveE4, posDecayBars,
-     exitScoreBars, liveE5, dBias, liveE6, srcClose, posPacLine, liveE7, oppSignalNow,
-     liveE8, exitMaxBars)
+// and the combiner returns no exit.
+liveRes = f_modelExit(posDir, na(posBar) ? 0 : bar_index - posBar, posStop, posTrail, posTarget,
+     liveE1, liveE3, liveE2, liveE4, liveE5, liveE6, liveE7, liveE8,
+     posDecayBars, exitScoreBars, dBias, srcClose, posPacLine, oppSignalNow,
+     exitMaxBars, exitStopFirst, exitGapFill, open, high, low, close)
 
 int   exitReason   = EXIT_NONE
 float exitFill     = na
@@ -1956,16 +1993,9 @@ if useExits and posDir != 0
     if age > 0
         posMfe := math.max(posMfe, posDir > 0 ? high - posEntry : posEntry - low)
         posMae := math.max(posMae, posDir > 0 ? posEntry - low  : high - posEntry)
-        // Price levels resolve first; a state rule fills at the close, since
-        // there is no level that was touched.
-        int rsn = fxReason
-        float fll = fxFill
-        if rsn == EXIT_NONE and stReason != EXIT_NONE
-            rsn := stReason
-            fll := close
-        if rsn != EXIT_NONE
-            exitReason   := rsn
-            exitFill     := fll
+        if liveRes.reason != EXIT_NONE
+            exitReason   := liveRes.reason
+            exitFill     := liveRes.fill
             exitFired    := true
             exitDirWas   := posDir
             exitEntryWas := posEntry
@@ -2040,7 +2070,9 @@ else
 if entryAccepted and finalDir != 0
     array.push(sigLog, SigRec.new(barIdx = bar_index, tm = time, dir = finalDir,
          score = totalScore, entry = close, atrAt = atrVal, mfe = 0.0, mae = 0.0,
-         ret = na, resolved = false))
+         ret = na, resolved = false,
+         fR = na, fReason = EXIT_NONE, fBars = 0, fDone = false,
+         sR = na, sReason = EXIT_NONE, sBars = 0, sDone = false))
     if array.size(sigLog) > logMaxSignals
         array.shift(sigLog)
 
@@ -2062,23 +2094,81 @@ if warmedUp and not na(rawScore) and not na(totalScore)
     peakRaw   := na(peakRaw)   ? rawScore   : math.max(peakRaw,   rawScore)
     peakFinal := na(peakFinal) ? totalScore : math.max(peakFinal, totalScore)
 
-// Advance every unresolved record. Objects held in an array are references,
-// so mutating `r` writes straight through to the stored record.
+// Advance every record that still has an unresolved track. Objects held in an
+// array are references, so mutating `r` writes straight through to the stored
+// record.
 //
 // The age > 0 guard means the signal bar itself contributes no excursion: the
 // entry is that bar's close, so its own high and low are not reachable from
 // the entry and counting them would invent excursion that never existed.
+//
+// DUAL TRACK (8.5c): every record carries three independent outcomes.
+//   ret    - the control. Fixed horizon, no exit rule applied at all.
+//   fR     - fixed-R:     E1 + E2 + optional E3, backstopped by E8.
+//   sR     - structural:  E1 as a floor, then E4-E7, backstopped by E8.
+// Both models are simulated on every record regardless of which one is live,
+// so the panel compares them without the user reconfiguring anything. All
+// three are quoted in the same R, defined by the E1 stop distance, so a
+// wide-stop model and a tight-stop model stay comparable.
 if array.size(sigLog) > 0
     for i = 0 to array.size(sigLog) - 1
         SigRec r = array.get(sigLog, i)
-        if not r.resolved and not na(r.entry) and r.entry > 0.0
+        bool allDone = r.resolved and r.fDone and r.sDone
+        if not allDone and not na(r.entry) and r.entry > 0.0
             int age = bar_index - r.barIdx
             if age > 0
+                // Trail from the extreme through the PREVIOUS bar, exactly as
+                // the live position does - r.mfe is not updated until below.
+                float rTrail = na(r.atrAt) ? na :
+                 (r.dir > 0 ? r.entry + r.mfe - exitTrailATR * r.atrAt
+                            : r.entry - r.mfe + exitTrailATR * r.atrAt)
+
                 r.mfe := math.max(r.mfe, r.dir > 0 ? high - r.entry : r.entry - low)
                 r.mae := math.max(r.mae, r.dir > 0 ? r.entry - low  : high - r.entry)
-                if age >= logHorizon
+
+                // ---- control track: horizon only ------------------------
+                if not r.resolved and age >= logHorizon
                     r.ret := (close - r.entry) / r.entry * 100.0 * r.dir
                     r.resolved := true
+
+                // Per-record inputs to the exit rules. Levels are recomputed
+                // from the frozen entry ATR rather than stored, so they cannot
+                // fall out of step with the inputs that define them.
+                float rStop = na(r.atrAt) ? na :
+                 (r.dir > 0 ? r.entry - exitStopATR * r.atrAt
+                            : r.entry + exitStopATR * r.atrAt)
+                float rTgt = na(r.atrAt) ? na :
+                 (r.dir > 0 ? r.entry + exitTargetATR * r.atrAt
+                            : r.entry - exitTargetATR * r.atrAt)
+                float rOneR = na(r.atrAt) or r.atrAt <= 0.0 ? na : exitStopATR * r.atrAt
+                int rDecay = r.dir > 0 ? decayBarsLong : decayBarsShort
+                float rPac = exitPacLineStr == "PAC mid" ? pacMid :
+                 (r.dir > 0 ? pacLower : pacUpper)
+                bool rOpp = entrySignalFresh and finalDir != 0 and finalDir != r.dir
+
+                // ---- track A: fixed-R -----------------------------------
+                if not r.fDone
+                    ExitRes fx = f_modelExit(r.dir, age, rStop, rTrail, rTgt,
+                         useE1, useE3, useE2, false, false, false, false, useE8,
+                         rDecay, exitScoreBars, dBias, srcClose, rPac, rOpp,
+                         exitMaxBars, exitStopFirst, exitGapFill, open, high, low, close)
+                    if fx.reason != EXIT_NONE
+                        r.fReason := fx.reason
+                        r.fBars   := age
+                        r.fR      := na(rOneR) ? na : (fx.fill - r.entry) * r.dir / rOneR
+                        r.fDone   := true
+
+                // ---- track B: structural --------------------------------
+                if not r.sDone
+                    ExitRes sx = f_modelExit(r.dir, age, rStop, na, na,
+                         useE1, false, false, useE4, useE5, useE6, useE7, useE8,
+                         rDecay, exitScoreBars, dBias, srcClose, rPac, rOpp,
+                         exitMaxBars, exitStopFirst, exitGapFill, open, high, low, close)
+                    if sx.reason != EXIT_NONE
+                        r.sReason := sx.reason
+                        r.sBars   := age
+                        r.sR      := na(rOneR) ? na : (sx.fill - r.entry) * r.dir / rOneR
+                        r.sDone   := true
 
 // ============================================================================
 //  VISUALS (Stage 7)
