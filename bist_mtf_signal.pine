@@ -729,6 +729,25 @@ var array<int> cdLastSignalBar = array.new_int(2, na)
 // Rolling window of the most recent accepted signals, oldest dropped first.
 var array<SigRec> sigLog = array.new<SigRec>()
 
+// ------------------------------------------------ Score reach (Stage 8) ---
+// How high the score ACTUALLY gets on this symbol, counted over every warmed
+// -up bar rather than only over bars that signalled. This exists to answer a
+// question the signal log structurally cannot: if the threshold is set above
+// anything the score ever reaches, there are no signals to have a win rate,
+// and an empty log looks identical to a well-tuned one that simply has not
+// triggered yet.
+//
+// Counted for the raw pre-veto score AND the post-veto score, so the two
+// columns separate "the layers never agree strongly enough" from "the layers
+// agree but the 1D bias keeps vetoing them" - completely different fixes.
+//
+// Bands: 0 = 80+, 1 = 70-79, 2 = 60-69, 3 = 50-59, 4 = under 50.
+var array<int> reachRaw   = array.new_int(5, 0)
+var array<int> reachFinal = array.new_int(5, 0)
+var int   reachBars = 0
+var float peakRaw   = na
+var float peakFinal = na
+
 var string srTicker = ""
 
 // STATE RESET on symbol change: none of this var state - pivot levels,
@@ -745,6 +764,11 @@ if syminfo.ticker != srTicker
     array.clear(srLows)
     array.fill(cdLastSignalBar, na)
     array.clear(sigLog)
+    array.fill(reachRaw,   0)
+    array.fill(reachFinal, 0)
+    reachBars := 0
+    peakRaw   := na
+    peakFinal := na
     divPxHi1  := na
     divPxHi2  := na
     divRsiHi1 := na
@@ -1667,6 +1691,24 @@ if entrySignalFresh and finalDir != 0
          ret = na, resolved = false))
     if array.size(sigLog) > logMaxSignals
         array.shift(sigLog)
+
+// ----------------------------------------------------------- Score reach ---
+// Warm-up bars are excluded. While the long averages are still filling, most
+// layers return their neutral 0.5 and the score sits artificially near 50,
+// which would put a false floor under the distribution.
+warmedUp = bar_index >= math.max(math.max(emaSlowLen, smaLen), math.max(atrAvgLen, volLen))
+
+f_reachBand(float score) =>
+    score >= 80.0 ? 0 : (score >= 70.0 ? 1 : (score >= 60.0 ? 2 : (score >= 50.0 ? 3 : 4)))
+
+if warmedUp and not na(rawScore) and not na(totalScore)
+    int bRaw = f_reachBand(rawScore)
+    int bFin = f_reachBand(totalScore)
+    array.set(reachRaw,   bRaw, array.get(reachRaw,   bRaw) + 1)
+    array.set(reachFinal, bFin, array.get(reachFinal, bFin) + 1)
+    reachBars := reachBars + 1
+    peakRaw   := na(peakRaw)   ? rawScore   : math.max(peakRaw,   rawScore)
+    peakFinal := na(peakFinal) ? totalScore : math.max(peakFinal, totalScore)
 
 // Advance every unresolved record. Objects held in an array are references,
 // so mutating `r` writes straight through to the stored record.
