@@ -639,21 +639,15 @@ exitMaxBars = input.int(250, "E8 max bars held", minval = 1, maxval = 500, group
 // -------------------------------------------------------- Performance log ---
 logMaxSignals = input.int(100, "Signals kept in the log", minval = 5, maxval = 300, group = G_LOG,
      tooltip = "Rolling window of the most recent accepted signals. Older ones are dropped, so the " +
-     "win rates describe recent behaviour rather than the whole chart's history.
-
-" +
+     "win rates describe recent behaviour rather than the whole chart's history.\n\n" +
      "THIS IS THE ONLY SAMPLE CAP. Every signal statistic in the panel - the band breakdown, the " +
      "exit-model comparison, the exit-reason shares and the suggested multiples - is computed by " +
      "scanning this log, so this number sets the n behind all of them. The SCORE REACH section is " +
-     "the exception: it counts bars, not signals, and is never capped.
-
-" +
+     "the exception: it counts bars, not signals, and is never capped.\n\n" +
      "It also bounds a quieter problem. A record is only dropped when the log overflows, but its " +
      "exit tracks can still be open - E8 alone allows 250 bars - and a record dropped while " +
      "pending is lost from the statistics silently. The window needs to be comfortably larger " +
-     "than the number of signals that fire inside one position's maximum lifetime.
-
-" +
+     "than the number of signals that fire inside one position's maximum lifetime.\n\n" +
      "Cost of raising it: the per-bar update loop walks the whole log, so very large values add " +
      "execution time on long histories.")
 logHorizon = input.int(10, "Outcome horizon (bars after signal)", minval = 1, maxval = 200,
