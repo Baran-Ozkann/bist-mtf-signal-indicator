@@ -690,8 +690,9 @@ type SigRec
     float score       // post-veto totalScore at the moment of the signal
     float entry       // close at the signal
     float atrAt       // ATR at the signal, to express excursions in ATR units
-    float mfe         // max favourable excursion so far, price units
-    float mae         // max adverse excursion so far, price units
+    float mfe         // max favourable excursion, price units - HORIZON-BOUNDED
+    float mae         // max adverse excursion, price units - HORIZON-BOUNDED
+    float tMfe        // favourable extreme over the whole TRADE, for the trail
     float ret         // return at the horizon, percent - na while pending
     bool  resolved    // horizon reached, ret is final
     // --- track A, fixed-R: E1 stop, E2 target, optional E3 trail, E8 ------
@@ -2095,7 +2096,7 @@ else
 if entryAccepted and finalDir != 0
     array.push(sigLog, SigRec.new(barIdx = bar_index, tm = time, dir = finalDir,
          score = totalScore, entry = close, atrAt = atrVal, mfe = 0.0, mae = 0.0,
-         ret = na, resolved = false,
+         ret = na, resolved = false, tMfe = 0.0,
          fR = na, fReason = EXIT_NONE, fBars = 0, fDone = false,
          sR = na, sReason = EXIT_NONE, sBars = 0, sDone = false))
     if array.size(sigLog) > logMaxSignals
@@ -2143,13 +2144,28 @@ if array.size(sigLog) > 0
             int age = bar_index - r.barIdx
             if age > 0
                 // Trail from the extreme through the PREVIOUS bar, exactly as
-                // the live position does - r.mfe is not updated until below.
+                // the live position does - tMfe is not updated until below.
                 float rTrail = na(r.atrAt) ? na :
-                 (r.dir > 0 ? r.entry + r.mfe - exitTrailATR * r.atrAt
-                            : r.entry - r.mfe + exitTrailATR * r.atrAt)
+                 (r.dir > 0 ? r.entry + r.tMfe - exitTrailATR * r.atrAt
+                            : r.entry - r.tMfe + exitTrailATR * r.atrAt)
 
-                r.mfe := math.max(r.mfe, r.dir > 0 ? high - r.entry : r.entry - low)
-                r.mae := math.max(r.mae, r.dir > 0 ? r.entry - low  : high - r.entry)
+                // TWO EXCURSION WINDOWS, and the distinction matters.
+                //
+                // mfe/mae stop at the HORIZON. They exist to calibrate the
+                // stop and target, and a stop calibrated from excursions
+                // measured inside a stopped trade is circular: a trade cut at
+                // 1.0 ATR can never report an MAE above 1.0 ATR, so the data
+                // would only ever confirm whatever stop was already set. The
+                // horizon window is independent of every exit rule, which is
+                // what makes it usable as evidence.
+                //
+                // tMfe runs for the whole trade, because the trailing stop
+                // needs the real high-water mark and has no interest in where
+                // the horizon fell.
+                if not r.resolved
+                    r.mfe := math.max(r.mfe, r.dir > 0 ? high - r.entry : r.entry - low)
+                    r.mae := math.max(r.mae, r.dir > 0 ? r.entry - low  : high - r.entry)
+                r.tMfe := math.max(r.tMfe, r.dir > 0 ? high - r.entry : r.entry - low)
 
                 // ---- control track: horizon only ------------------------
                 if not r.resolved and age >= logHorizon
