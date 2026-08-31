@@ -14,8 +14,8 @@
 //  [x] Stage 6  Cooldown + earnings blacklist
 //  [x] Stage 7  Visuals (plotshape, colour coding, score label)
 //  [x] Stage 8  Performance log panel
-//  [x] Stage 8.5 Exit logic (positions, exit rules, comparison)  <-- CURRENT
-//  [ ] Stage 9  Unified alertcondition()
+//  [x] Stage 8.5 Exit logic (positions, exit rules, comparison)
+//  [x] Stage 9  Unified alertcondition()  <-- CURRENT
 //  [ ] Stage 10 End-to-end / repaint testing
 //
 // ============================================================================
@@ -2166,6 +2166,58 @@ if useExits
 else
     if entryAccepted and finalDir != 0
         array.set(cdLastSignalBar, finalDir > 0 ? 0 : 1, bar_index)
+
+// ============================================================================
+//  ALERTS (Stage 9)                                   UNIFIED alertcondition()
+// ============================================================================
+//  Two conditions, no more. The spec is explicit that layer-level events (a
+//  PAC touch alone, a divergence alone) must never reach an alert - only the
+//  fully-gated entry and the position-closing exit do. Both states are already
+//  computed above for the chart markers and the score label; this section adds
+//  no new logic, it only narrates the two moments TradingView can fire on.
+//
+//  DYNAMIC TEXT IN alertcondition(): the `message` argument is a compile-time
+//  string, so it cannot concatenate a SERIES value directly - str.tostring()
+//  inside it does not compile. TradingView's documented workaround is the
+//  {{plot("Title")}} placeholder: it is substituted, AT ALERT-FIRE TIME, with
+//  the value the named plot() call held on the bar the condition became true.
+//  "Total Score" already exists as a plot (the score line, above); direction
+//  and the exit fields below get small display.none plots purely so the alert
+//  text can reach them. Direction travels as +1 / -1 rather than the word
+//  LONG/SHORT: a placeholder can only ever resolve to a number, so the mapping
+//  is spelled out in the message text itself instead of computed.
+// ============================================================================
+plot(finalDir,   "Alert: Direction",   display = display.none)
+plot(exitDirWas, "Alert: Exit Dir",    display = display.none)
+plot(exitR,      "Alert: Exit R",      display = display.none)
+plot(exitReason, "Alert: Exit Reason", display = display.none)
+
+// ---------------------------------------------------------- Entry alert ---
+// Fires on the same bar as the entry triangle: entryAccepted already IS
+// "score crossed the threshold AND the 1D veto passed AND the 15m exhaustion
+// gate opened" (scoreArmed -> entryReady -> entrySignal, taken fresh, then
+// cooldown-clear and no position already open) - the three-part condition the
+// spec asks for, plus the cooldown / no-pyramiding rules this build adds on
+// top of it. ONE unified condition, not a long one and a short one: direction
+// is read from the placeholder, per spec.
+alertcondition(entryAccepted, title = "BIST MTF - Entry Signal",
+     message = "BIST MTF entry | {{ticker}} {{interval}} | " +
+     "dir={{plot(\"Alert: Direction\")}} (+1 LONG / -1 SHORT) | " +
+     "score={{plot(\"Total Score\")}}")
+
+// ----------------------------------------------------------- Exit alert ---
+// The second alert agreed alongside the Stage 8.5 exit logic: fires once, on
+// the bar a live position actually closes (exitFired), whichever rule closed
+// it and whichever model (Fixed-R / Structural) is live. Reason travels as
+// the numeric E1-E8 code defined earlier in this file, not its name - a
+// placeholder cannot resolve f_exitName(), because that is a function call,
+// not a plot.
+alertcondition(exitFired, title = "BIST MTF - Exit Signal",
+     message = "BIST MTF exit | {{ticker}} {{interval}} | " +
+     "dir={{plot(\"Alert: Exit Dir\")}} (+1 LONG / -1 SHORT) | " +
+     "R={{plot(\"Alert: Exit R\")}} | " +
+     "reasonCode={{plot(\"Alert: Exit Reason\")}} " +
+     "(1 stop 2 target 3 trail 4 decay 5 bias 6 PAC 7 opposite 8 time)")
 
 // ============================================================================
 //  PERFORMANCE LOG - signal recording and outcome tracking (Stage 8)
