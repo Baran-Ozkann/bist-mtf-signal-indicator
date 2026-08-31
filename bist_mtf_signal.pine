@@ -194,6 +194,7 @@ const string G_ENT  = "Entry Timing (1h)"
 const string G_EXH  = "Exhaustion Gate (15m)"
 const string G_CD   = "Cooldown (Anti-Whipsaw)"
 const string G_KAP  = "Earnings / KAP Blacklist"
+const string G_LOG  = "Performance Log"
 const string G_DISP = "Display"
 
 // ---------------------------------------------------------------- General ---
@@ -523,6 +524,16 @@ kapDate2 = input.time(KAP_UNSET, "Earnings / KAP date 2", group = G_KAP)
 kapDate3 = input.time(KAP_UNSET, "Earnings / KAP date 3", group = G_KAP)
 kapDate4 = input.time(KAP_UNSET, "Earnings / KAP date 4", group = G_KAP)
 
+// -------------------------------------------------------- Performance log ---
+logMaxSignals = input.int(25, "Signals kept in the log", minval = 5, maxval = 100, group = G_LOG,
+     tooltip = "Rolling window of the most recent accepted signals. Older ones are dropped, so the " +
+     "win rates describe recent behaviour rather than the whole chart's history.")
+logHorizon = input.int(10, "Outcome horizon (bars after signal)", minval = 1, maxval = 200,
+     group = G_LOG,
+     tooltip = "How many bars after a signal the outcome is measured. A signal younger than this " +
+     "is reported as PENDING rather than being counted as a win or a loss - counting it early " +
+     "would flatter whichever direction the last few bars happened to run.")
+
 // ---------------------------------------------------------------- Display ---
 // TWO MASTER SWITCHES, per spec. Everything a trader acts on sits under the
 // first; everything that exists only to explain WHY sits under the second.
@@ -555,6 +566,28 @@ showLayers     = input.bool(false, "Debug: individual layer confidences", group 
      tooltip = "Each layer's own 0.0-1.0 confidence, scaled to the pane's 0-100 axis, for the " +
      "CANDIDATE direction (pre-veto, so the traces stay readable while the score is zeroed). " +
      "Twelve overlapping lines is a lot: hide the ones you are not chasing in the Style tab.")
+
+// ============================================================================
+//  TYPES
+// ============================================================================
+// One record per accepted signal, for the performance log. A user type rather
+// than ten parallel arrays: parallel arrays drift out of sync the first time
+// somebody adds a push to one and forgets the others, and nothing catches it.
+//
+// Excursions are stored in PRICE units and divided by atrAt only at display
+// time, so the record stays meaningful even if the ATR input is changed
+// later.
+type SigRec
+    int   barIdx      // chart bar_index the signal fired on
+    int   tm          // bar time in ms, for the date column
+    int   dir         // +1 long, -1 short
+    float score       // post-veto totalScore at the moment of the signal
+    float entry       // close at the signal
+    float atrAt       // ATR at the signal, to express excursions in ATR units
+    float mfe         // max favourable excursion so far, price units
+    float mae         // max adverse excursion so far, price units
+    float ret         // return at the horizon, percent - na while pending
+    bool  resolved    // horizon reached, ret is final
 
 // ============================================================================
 //  HELPERS
@@ -692,6 +725,10 @@ var float divRsiLo2 = na
 // Stage 8's log can extend the same pattern. na = no signal yet this symbol.
 var array<int> cdLastSignalBar = array.new_int(2, na)
 
+// ---------------------------------------------- Performance log (Stage 8) ---
+// Rolling window of the most recent accepted signals, oldest dropped first.
+var array<SigRec> sigLog = array.new<SigRec>()
+
 var string srTicker = ""
 
 // STATE RESET on symbol change: none of this var state - pivot levels,
@@ -707,6 +744,7 @@ if syminfo.ticker != srTicker
     array.clear(srHighs)
     array.clear(srLows)
     array.fill(cdLastSignalBar, na)
+    array.clear(sigLog)
     divPxHi1  := na
     divPxHi2  := na
     divRsiHi1 := na
@@ -1604,6 +1642,49 @@ cooldownBlocked = entryFreshRaw and not cooldownClear
 // realtime tick, so an intrabar flicker cannot leave a false entry behind.
 if entrySignalFresh and finalDir != 0
     array.set(cdLastSignalBar, finalDir > 0 ? 0 : 1, bar_index)
+
+// ============================================================================
+//  PERFORMANCE LOG - signal recording and outcome tracking (Stage 8)
+// ============================================================================
+//  Every accepted signal is recorded, then followed bar by bar until the
+//  horizon is reached. Three things are measured, because "did it win?" alone
+//  cannot tell you how to trade the signal:
+//
+//    ret : close-to-close return at the horizon, direction-adjusted. The
+//          outcome the spec asks for.
+//    MFE : maximum FAVOURABLE excursion - how far it went the right way at
+//          its best. This is what a take-profit could have captured.
+//    MAE : maximum ADVERSE excursion - how far it went the wrong way before
+//          it worked. This is what a stop would have had to survive.
+//
+//  MFE and MAE are the inputs an exit rule is designed from: a signal set
+//  with MFE 2.5 ATR and MAE 0.4 ATR wants a wide target and a tight stop,
+//  and one with the reverse wants neither. The panel reports them per band.
+// ============================================================================
+if entrySignalFresh and finalDir != 0
+    array.push(sigLog, SigRec.new(barIdx = bar_index, tm = time, dir = finalDir,
+         score = totalScore, entry = close, atrAt = atrVal, mfe = 0.0, mae = 0.0,
+         ret = na, resolved = false))
+    if array.size(sigLog) > logMaxSignals
+        array.shift(sigLog)
+
+// Advance every unresolved record. Objects held in an array are references,
+// so mutating `r` writes straight through to the stored record.
+//
+// The age > 0 guard means the signal bar itself contributes no excursion: the
+// entry is that bar's close, so its own high and low are not reachable from
+// the entry and counting them would invent excursion that never existed.
+if array.size(sigLog) > 0
+    for i = 0 to array.size(sigLog) - 1
+        SigRec r = array.get(sigLog, i)
+        if not r.resolved and not na(r.entry) and r.entry > 0.0
+            int age = bar_index - r.barIdx
+            if age > 0
+                r.mfe := math.max(r.mfe, r.dir > 0 ? high - r.entry : r.entry - low)
+                r.mae := math.max(r.mae, r.dir > 0 ? r.entry - low  : high - r.entry)
+                if age >= logHorizon
+                    r.ret := (close - r.entry) / r.entry * 100.0 * r.dir
+                    r.resolved := true
 
 // ============================================================================
 //  VISUALS (Stage 7)
