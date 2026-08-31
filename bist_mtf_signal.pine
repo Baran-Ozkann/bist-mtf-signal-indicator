@@ -18,10 +18,10 @@
 //  [ ] Stage 10 End-to-end / repaint testing
 //
 // ============================================================================
-//  request.security() CALL INVENTORY  (Stage 4)
+//  request.security() CALL INVENTORY  (Stage 5)
 // ============================================================================
-//  COUNT: 4  (budget target for the finished script: 5 - Stage 5 adds the
-//            optional USDTRY reference and nothing after that needs one)
+//  COUNT: 5  (final - stages 6-10 add no further references, so this is the
+//            script's permanent footprint and it sits inside Pine's limit)
 //
 //  #1  Directional bias lock          [Stage 2]
 //      symbol    : syminfo.tickerid          (never hardcoded)
@@ -81,6 +81,23 @@
 //      settles when the bar closes. idxConfirmedOnly (default OFF) exists
 //      only for users who point idxTF at a HIGHER timeframe, where the
 //      developing-bar problem described above would otherwise apply.
+//
+//  #5  USDTRY / FX correlation        [Stage 5]
+//      symbol    : fxSymbol input, default "FX_IDC:USDTRY"  (input.symbol -
+//                  the spec forbids hardcoding this one in particular)
+//      timeframe : fxTF input, default "" = the chart timeframe
+//      expression: f_indexExpr(off, lb) -> FX % change over lb bars
+//                  REUSED from call #4: the two layers ask the same question
+//                  of different symbols, so they share one expression.
+//      lookahead : barmerge.lookahead_off
+//      gaps      : barmerge.gaps_off  (FX trades when BIST does not and vice
+//                  versa; holding the last known move beats blanking it)
+//      ALWAYS EVALUATED: layer 12 ships DISABLED, but the call itself is made
+//      unconditionally at global scope. Pine would still count a call placed
+//      inside a conditional, so hiding it there would buy nothing and cost
+//      clarity. With the layer off the returned value is simply never read.
+//      A user with no FX data entitlement gets na, which the layer degrades
+//      to neutral 0.5 rather than an error.
 //
 //  Chart-timeframe work needs no security call: Heikin Ashi is derived
 //  arithmetically from the chart's own real OHLC (see the HA block below)
@@ -171,6 +188,7 @@ const string G_L8   = "Layer 8 - Market / Index Correlation"
 const string G_L9   = "Layer 9 - Liquidity Sweep"
 const string G_L10  = "Layer 10 - RSI / Price Divergence"
 const string G_L11  = "Layer 11 - Candle Pattern Confirmation"
+const string G_L12  = "Layer 12 - USDTRY Correlation (optional)"
 const string G_ENT  = "Entry Timing (1h)"
 const string G_EXH  = "Exhaustion Gate (15m)"
 const string G_DISP = "Display"
@@ -380,6 +398,37 @@ cpEngConf = input.float(0.8, "Confidence: engulfing", minval = 0.0, maxval = 1.0
      tooltip = "Engulfing scores higher than a pin bar by default: it requires the whole prior body " +
      "to be reversed rather than just a wick rejection. Both patterns on the same bar sum and clamp " +
      "to 1.0.")
+
+// --------------------------------------------------------------- Layer 12 ---
+// Ships DISABLED: FX linkage is a per-company fact the script cannot derive
+// from bar data. An exporter and an importer react to the same lira move in
+// opposite directions, so a wrong setting here is worse than none at all.
+const string LINK_NONE = "No FX linkage (neutral)"
+const string LINK_EXP  = "Exporter - a weaker lira helps"
+const string LINK_IMP  = "Importer - a weaker lira hurts"
+
+useL12 = input.bool(false, "Enable Layer 12", group = G_L12,
+     tooltip = "Off by default. Turn it on only after setting the linkage below to match the " +
+     "company's actual FX exposure.")
+wL12   = input.float(5.0, "Weight", minval = 0.0, maxval = 100.0, step = 0.5, group = G_L12)
+fxLinkage = input.string(LINK_NONE, "FX linkage of this company",
+     options = [LINK_NONE, LINK_EXP, LINK_IMP], group = G_L12,
+     tooltip = "EXPORTER: revenue in hard currency, costs in lira - a rising USDTRY is a tailwind. " +
+     "IMPORTER: input costs or FX debt in hard currency - a rising USDTRY is a headwind. " +
+     "NEUTRAL leaves the layer at 0.5 even when it is enabled, which is the safe default if you " +
+     "are unsure.")
+fxSymbol = input.symbol("FX_IDC:USDTRY", "FX symbol", group = G_L12,
+     tooltip = "Never hardcoded, per the spec. Point this at whichever USDTRY feed your " +
+     "subscription carries, or at another currency pair if that is the one this company is " +
+     "exposed to.")
+fxTF = input.timeframe("", "FX timeframe (blank = chart timeframe)", group = G_L12)
+fxLookback = input.int(1, "FX return lookback (bars)", minval = 1, maxval = 100, group = G_L12)
+fxNeutralPct = input.float(0.10, "Neutral band (percent move)", minval = 0.0, step = 0.05,
+     group = G_L12,
+     tooltip = "An FX move smaller than this counts as directionless and scores 0.5.")
+fxConfirmedOnly = input.bool(false, "FX TF: use last CLOSED bar only", group = G_L12,
+     tooltip = "Only meaningful if the FX timeframe above is HIGHER than the chart timeframe - " +
+     "same reasoning as the index layer.")
 
 // ------------------------------------------------- Entry timing (1h) ---
 useEntryTiming = input.bool(true, "Enable 1h entry timing", group = G_ENT,
@@ -1019,6 +1068,50 @@ f_candlePatternScore(int dir, float o, float h, float l, float c, float po, floa
     out
 
 // ============================================================================
+//  LAYER 12 - USDTRY CORRELATION               (design weight 5, OFF by default)
+//  A rising USDTRY means a weaker lira. Whether that helps or hurts is a
+//  property of the company, not of the chart, so the user declares it:
+//    EXPORTER : weaker lira -> tailwind  -> a rising USDTRY supports a LONG
+//    IMPORTER : weaker lira -> headwind  -> a rising USDTRY supports a SHORT
+//    NEUTRAL  : 0.5 regardless, the safe default
+//
+//  Grading matches layer 8's three-state scheme: agreement 1.0, inside the
+//  neutral band 0.5, disagreement 0.0.
+//
+//  WEIGHT REDISTRIBUTION: with this layer disabled the live weights total 95
+//  of 100. The "Renormalise score across ENABLED layers only" switch in the
+//  General group decides whether the score still spans 0-100 (ON, default)
+//  or simply loses those five points (OFF).
+//
+//  NA GUARD: no FX data - a feed the user is not subscribed to, or warm-up -
+//  returns neutral 0.5.
+// ============================================================================
+// Reuses f_indexExpr from layer 8: percentage change over lb bars, evaluated
+// inside the requested symbol's context, with `off` stepping back one bar of
+// THAT symbol when the confirmed-bar toggle is on.
+fxChgRaw = request.security(fxSymbol, fxTF,
+     f_indexExpr(fxConfirmedOnly ? 1 : 0, fxLookback),
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+// Linkage resolved to a sign once, at global scope, so the score function
+// never has to compare strings.
+fxSign = fxLinkage == LINK_EXP ? 1 : (fxLinkage == LINK_IMP ? -1 : 0)
+
+f_usdtryScore(int dir, float chgPct, float neutralPct, int linkSign) =>
+    float out = 0.5
+    if na(chgPct) or linkSign == 0 or dir == 0
+        out := 0.5
+    else if math.abs(chgPct) <= neutralPct
+        out := 0.5
+    else
+        // The FX move implies a direction for the STOCK once the linkage
+        // sign is applied: a rising pair times an exporter's +1 implies a
+        // long, times an importer's -1 implies a short.
+        int impliedDir = (chgPct > 0.0 ? 1 : -1) * linkSign
+        out := impliedDir == dir ? 1.0 : 0.0
+    out
+
+// ============================================================================
 //  SCORE AGGREGATION
 //  Both hypotheses are scored every bar; the stronger one becomes the
 //  candidate direction. Every layer is computed unconditionally (keeps ta.*
@@ -1063,9 +1156,12 @@ s11Long  = f_candlePatternScore( 1, open, high, low, close, open[1], close[1],
 s11Short = f_candlePatternScore(-1, open, high, low, close, open[1], close[1],
      cpMaxBody, cpMinWick, cpPinConf, cpEngConf)
 
+s12Long  = f_usdtryScore( 1, fxChgRaw, fxNeutralPct, fxSign)
+s12Short = f_usdtryScore(-1, fxChgRaw, fxNeutralPct, fxSign)
+
 // No c5 parameter: layer 5 is the hard veto and carries no weight.
 f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8,
-     float c9, float c10, float c11) =>
+     float c9, float c10, float c11, float c12) =>
     float num = 0.0
     float den = 0.0
     if useL1
@@ -1098,6 +1194,9 @@ f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8
     if useL11
         num += c11 * wL11
         den += wL11
+    if useL12
+        num += c12 * wL12
+        den += wL12
     float outv = 0.0
     if normalizeWeights
         outv := den > 0.0 ? num / den * 100.0 : 0.0
@@ -1106,9 +1205,9 @@ f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8
     f_clamp(outv, 0.0, 100.0)
 
 longScore  = f_aggregate(s1Long,  s2Long,  s3Long,  s4Both, s6Long,  s7Both, s8Long,
-     s9Long,  s10Long,  s11Long)
+     s9Long,  s10Long,  s11Long,  s12Long)
 shortScore = f_aggregate(s1Short, s2Short, s3Short, s4Both, s6Short, s7Both, s8Short,
-     s9Short, s10Short, s11Short)
+     s9Short, s10Short, s11Short, s12Short)
 
 // Candidate direction: +1 long, -1 short, 0 tie/flat.
 sigDir  = longScore > shortScore ? 1 : (shortScore > longScore ? -1 : 0)
