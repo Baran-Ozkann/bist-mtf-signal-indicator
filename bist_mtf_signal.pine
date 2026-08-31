@@ -1658,6 +1658,53 @@ plotchar(showEntrySignals and entrySignalFresh and earningsRisk, "Entry in earni
      "!", location.top, color = color.new(color.orange, 0), size = size.tiny,
      force_overlay = true)
 
+// ------------------------------------------------------------- Score label ---
+// Rebuilt on the LAST BAR ONLY. One label per historical bar would be
+// unreadable and would burn through Pine's drawing-object budget in a few
+// hundred bars; the label describes the live state, which only the last bar
+// has. Same discipline the Stage 8 performance panel will follow.
+//
+// The state line answers the question the score alone cannot: if this is not
+// a signal, which gate is it stuck at? That is the difference between "the
+// setup is worthless" and "the setup is one exhaustion bar away".
+f_bandName(float score) =>
+    score >= 80 ? "80+" : (score >= 60 ? "60-79" : (score >= 40 ? "40-59" : "<40"))
+
+var label scoreLbl = na
+
+if barstate.islast
+    label.delete(scoreLbl)
+    if showEntrySignals
+        string dirTxt = finalDir > 0 ? "LONG" : (finalDir < 0 ? "SHORT" : "NEUTRAL")
+        string biasTxt = dBias > 0 ? "long" : (dBias < 0 ? "short" : "neutral")
+
+        // Ordered most-advanced first, so the first match is the furthest the
+        // setup actually got.
+        string stateTxt = "below threshold"
+        if entrySignalFresh
+            stateTxt := "ENTRY SIGNAL"
+        else if cooldownBlocked
+            stateTxt := "setup blocked by cooldown"
+        else if entrySignal
+            stateTxt := "gates open - signal already fired"
+        else if entryReady
+            stateTxt := "entry ready - waiting on exhaustion gate"
+        else if scoreArmed
+            stateTxt := "armed - waiting on entry timing"
+        else if not vetoPassed
+            stateTxt := "vetoed by 1D bias"
+
+        string txt = dirTxt + "  " + str.tostring(totalScore, "#.0") +
+         "  (band " + f_bandName(totalScore) + ")" +
+         "\n" + stateTxt +
+         "\n1D bias: " + biasTxt +
+         (earningsRisk ? "\n! earnings / KAP window" : "")
+
+        scoreLbl := label.new(bar_index + 2, totalScore, txt,
+             xloc = xloc.bar_index, yloc = yloc.price,
+             color = color.new(f_dirColor(finalDir), 15), style = label.style_label_left,
+             textcolor = color.white, size = size.small, textalign = text.align_left)
+
 // ------------------------------------------------------------ Debug traces ---
 plot(dbgRawScore   ? rawScore   : na, "Debug: Raw Score (pre-veto)",
      color = color.new(color.gray, 60))
