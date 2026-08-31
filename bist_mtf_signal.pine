@@ -145,7 +145,8 @@
 //  Heikin Ashi (optional, default ON) : PAC channel, regime EMA ordering
 //  Real OHLC (always)                 : ADX, SMA50, RSI, MACD, volume, ATR,
 //                                       pivot S/R levels, index close
-//  Real OHLC (later, mandatory)       : layer 9 liquidity sweep, layer 11 candles
+//  Real OHLC (mandatory, now shipped) : layer 9 liquidity sweep, layer 10
+//                                       divergence pivots, layer 11 candles
 // ============================================================================
 
 //@version=6
@@ -169,6 +170,7 @@ const string G_L7   = "Layer 7 - Volatility Regime (ATR)"
 const string G_L8   = "Layer 8 - Market / Index Correlation"
 const string G_L9   = "Layer 9 - Liquidity Sweep"
 const string G_L10  = "Layer 10 - RSI / Price Divergence"
+const string G_L11  = "Layer 11 - Candle Pattern Confirmation"
 const string G_ENT  = "Entry Timing (1h)"
 const string G_EXH  = "Exhaustion Gate (15m)"
 const string G_DISP = "Display"
@@ -361,6 +363,23 @@ divMinRsiGap = input.float(1.0, "Minimum RSI gap between the two pivots (points)
      "difference would register as a divergence.")
 divFloorConf = input.float(0.3, "Confidence at the oldest allowed bar", minval = 0.0, maxval = 1.0,
      step = 0.05, group = G_L10)
+
+// --------------------------------------------------------------- Layer 11 ---
+useL11 = input.bool(true, "Enable Layer 11", group = G_L11)
+wL11   = input.float(5.0, "Weight", minval = 0.0, maxval = 100.0, step = 0.5, group = G_L11)
+cpMaxBody = input.float(0.35, "Pin bar: max body / range", minval = 0.01, maxval = 1.0, step = 0.05,
+     group = G_L11,
+     tooltip = "Deliberately SEPARATE from the 15m exhaustion gate's pin settings. This layer reads " +
+     "the signal timeframe, where a meaningful rejection candle looks different from one on a 15m " +
+     "chart, so the two are tuned independently.")
+cpMinWick = input.float(2.0, "Pin bar: min wick / body", minval = 0.5, step = 0.1, group = G_L11)
+cpPinConf = input.float(0.6, "Confidence: pin bar", minval = 0.0, maxval = 1.0, step = 0.05,
+     group = G_L11)
+cpEngConf = input.float(0.8, "Confidence: engulfing", minval = 0.0, maxval = 1.0, step = 0.05,
+     group = G_L11,
+     tooltip = "Engulfing scores higher than a pin bar by default: it requires the whole prior body " +
+     "to be reversed rather than just a wick rejection. Both patterns on the same bar sum and clamp " +
+     "to 1.0.")
 
 // ------------------------------------------------- Entry timing (1h) ---
 useEntryTiming = input.bool(true, "Enable 1h entry timing", group = G_ENT,
@@ -974,6 +993,32 @@ f_divergenceScore(int dir, float px1, float px2, float rsi1, float rsi2, int bar
     out
 
 // ============================================================================
+//  LAYER 11 - CANDLE PATTERN CONFIRMATION      (design weight 5)
+//  REAL OHLC IS MANDATORY HERE (mixed-candle policy) - the candle primitives
+//  near the top of the file carry the full explanation: Heikin Ashi opens are
+//  synthetic midpoints, so nearly every HA bar reads as an engulfing and the
+//  pattern loses all meaning.
+//
+//  Reuses f_isPinBar() and f_isEngulfing(), the same primitives the 1h entry
+//  confirmation and the 15m exhaustion gate call, with this layer's own
+//  thresholds. One implementation of each pattern, three callers.
+//
+//  Scores sum and clamp: a bar that is both a pin and an engulfing is the
+//  strongest possible confirmation. No pattern -> 0.0, a known negative.
+//  na OHLC (a gap in the feed) -> neutral 0.5.
+// ============================================================================
+f_candlePatternScore(int dir, float o, float h, float l, float c, float po, float pc,
+     float maxBody, float minWick, float pinConf, float engConf) =>
+    float out = 0.0
+    if na(o) or na(h) or na(l) or na(c)
+        out := 0.5
+    else
+        bool pin = f_isPinBar(dir, o, h, l, c, maxBody, minWick)
+        bool eng = f_isEngulfing(dir, o, c, po, pc)
+        out := f_clamp((pin ? pinConf : 0.0) + (eng ? engConf : 0.0), 0.0, 1.0)
+    out
+
+// ============================================================================
 //  SCORE AGGREGATION
 //  Both hypotheses are scored every bar; the stronger one becomes the
 //  candidate direction. Every layer is computed unconditionally (keeps ta.*
@@ -1012,9 +1057,15 @@ s10Long  = f_divergenceScore( 1, divPxLo1, divPxLo2, divRsiLo1, divRsiLo2, divBa
 s10Short = f_divergenceScore(-1, divPxHi1, divPxHi2, divRsiHi1, divRsiHi2, divBarsSinceHi,
      divMaxAge, divMinRsiGap, divFloorConf)
 
+// REAL OHLC, never the HA-aware source - see the layer 11 header.
+s11Long  = f_candlePatternScore( 1, open, high, low, close, open[1], close[1],
+     cpMaxBody, cpMinWick, cpPinConf, cpEngConf)
+s11Short = f_candlePatternScore(-1, open, high, low, close, open[1], close[1],
+     cpMaxBody, cpMinWick, cpPinConf, cpEngConf)
+
 // No c5 parameter: layer 5 is the hard veto and carries no weight.
 f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8,
-     float c9, float c10) =>
+     float c9, float c10, float c11) =>
     float num = 0.0
     float den = 0.0
     if useL1
@@ -1044,6 +1095,9 @@ f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8
     if useL10
         num += c10 * wL10
         den += wL10
+    if useL11
+        num += c11 * wL11
+        den += wL11
     float outv = 0.0
     if normalizeWeights
         outv := den > 0.0 ? num / den * 100.0 : 0.0
@@ -1052,9 +1106,9 @@ f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8
     f_clamp(outv, 0.0, 100.0)
 
 longScore  = f_aggregate(s1Long,  s2Long,  s3Long,  s4Both, s6Long,  s7Both, s8Long,
-     s9Long,  s10Long)
+     s9Long,  s10Long,  s11Long)
 shortScore = f_aggregate(s1Short, s2Short, s3Short, s4Both, s6Short, s7Both, s8Short,
-     s9Short, s10Short)
+     s9Short, s10Short, s11Short)
 
 // Candidate direction: +1 long, -1 short, 0 tie/flat.
 sigDir  = longScore > shortScore ? 1 : (shortScore > longScore ? -1 : 0)
