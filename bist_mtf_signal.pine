@@ -140,6 +140,7 @@ const string G_L2   = "Layer 2 - PAC Crossover"
 const string G_L3   = "Layer 3 - Momentum (RSI + MACD)"
 const string G_L4   = "Layer 4 - Volume Confirmation"
 const string G_L5   = "Layer 5 - 1D Directional Lock (hard veto)"
+const string G_L6   = "Layer 6 - Structural Level Proximity (S/R)"
 const string G_ENT  = "Entry Timing (1h)"
 const string G_EXH  = "Exhaustion Gate (15m)"
 const string G_DISP = "Display"
@@ -149,9 +150,14 @@ scoreThreshold = input.int(70, "Signal score threshold", minval = 1, maxval = 10
      tooltip = "Reference line only in Stage 1. Becomes the live signal trigger in Stage 9.")
 normalizeWeights = input.bool(true, "Renormalise score across ENABLED layers only", group = G_GEN,
      tooltip = "WEIGHT REDISTRIBUTION: total design weight is 100 across all 13 layers. " +
-     "Stage 1 only ships layers 1-4 (55 of 100). With this ON the score is divided by the sum of " +
-     "enabled weights, so it always spans 0-100. With it OFF the raw weighted sum is shown, so " +
-     "disabling a layer removes its contribution WITHOUT redistributing it (max drops below 100).")
+     "With this ON the score is divided by the sum of enabled weights, so it always spans 0-100. " +
+     "With it OFF the raw weighted sum is shown, so disabling a layer removes its contribution " +
+     "WITHOUT redistributing it and the maximum drops below 100. Note that not every layer has " +
+     "shipped yet, so the sum of live weights is still under 100 either way.")
+atrLen = input.int(14, "ATR length (shared by layers 6 and 7)", minval = 1, group = G_GEN,
+     tooltip = "One ATR series feeds both the S/R distance normalisation (layer 6) and the " +
+     "volatility regime test (layer 7), so the two layers cannot disagree about what one ATR means. " +
+     "Always computed from REAL OHLC - true range on Heikin Ashi bars understates real risk.")
 
 // ----------------------------------------------------------- Candle source ---
 useHA = input.bool(true, "Use Heikin Ashi for PAC / EMA layers", group = G_SRC,
@@ -212,6 +218,34 @@ dSmaLen     = input.int(50,  "1D SMA length",  minval = 1, group = G_L5)
 dEmaFastLen = input.int(21,  "1D EMA fast",    minval = 1, group = G_L5)
 dEmaMedLen  = input.int(50,  "1D EMA medium",  minval = 1, group = G_L5)
 dEmaSlowLen = input.int(200, "1D EMA slow",    minval = 1, group = G_L5)
+
+// ---------------------------------------------------------------- Layer 6 ---
+useL6 = input.bool(true, "Enable Layer 6", group = G_L6)
+wL6   = input.float(10.0, "Weight", minval = 0.0, maxval = 100.0, step = 0.5, group = G_L6)
+srLeft = input.int(5, "Pivot leftbars", minval = 1, maxval = 50, group = G_L6,
+     tooltip = "LOOKBACK JUSTIFICATION - leftbars = 5: a swing point must dominate the five bars " +
+     "before it. On the 4h signal timeframe that is roughly a trading week of context - enough to " +
+     "reject intrabar noise without demanding a major monthly extreme.")
+srRight = input.int(2, "Pivot rightbars", minval = 1, maxval = 50, group = G_L6,
+     tooltip = "LOOKBACK JUSTIFICATION - rightbars = 2: the pivot is published two bars AFTER it " +
+     "printed, so the level is confirmed and can never shift on the realtime bar. Larger values are " +
+     "even safer but delay every level by that many bars; 2 is the smallest value that still gives " +
+     "genuine two-sided confirmation.")
+srKeep = input.int(5, "Confirmed pivots kept per side", minval = 1, maxval = 20, group = G_L6,
+     tooltip = "Rolling window of recent confirmed pivot highs and pivot lows. Older levels are " +
+     "dropped: structure from 200 bars ago rarely still holds.")
+srNearAtr = input.float(0.5, "Near anchor: distance in ATR -> confidence 1.0", minval = 0.0,
+     step = 0.1, group = G_L6)
+srFarAtr = input.float(3.0, "Far anchor: distance in ATR -> confidence 0.0", minval = 0.1,
+     step = 0.1, group = G_L6)
+srUseHeadroom = input.bool(true, "Penalise when the opposing level is close", group = G_L6,
+     tooltip = "Sitting right on support is only attractive if there is room to run. With this ON, " +
+     "a long whose nearest overhead resistance is closer than the threshold below is multiplied " +
+     "down. Turn OFF for the plain spec behaviour (distance to the nearest level only).")
+srHeadroomAtr = input.float(0.5, "Headroom threshold (ATR units)", minval = 0.0, step = 0.1,
+     group = G_L6)
+srHeadroomMult = input.float(0.5, "Headroom penalty multiplier", minval = 0.0, maxval = 1.0,
+     step = 0.05, group = G_L6)
 
 // ------------------------------------------------- Entry timing (1h) ---
 useEntryTiming = input.bool(true, "Enable 1h entry timing", group = G_ENT,
@@ -348,6 +382,44 @@ rsiMaVal = ta.sma(rsiVal, rsiSmoothLen)
 
 volAvg = ta.sma(volume, volLen)                          // real volume
 
+atrVal = ta.atr(atrLen)                                  // real OHLC (true range)
+
+// ------------------------------------------- Confirmed pivot S/R levels ---
+// REAL high/low deliberately, not the HA-aware source: a support or
+// resistance level is a price other market participants can see and react to.
+// Heikin Ashi extremes are synthetic averages that were never traded at.
+//
+// REPAINT SAFETY: ta.pivothigh/ta.pivotlow return a value only srRight bars
+// AFTER the pivot bar printed. Every level that reaches these arrays is
+// therefore already confirmed and can never shift or vanish on the realtime
+// bar. Unconfirmed "live" pivots are deliberately not used anywhere.
+pivotHi = ta.pivothigh(high, srLeft, srRight)
+pivotLo = ta.pivotlow(low,   srLeft, srRight)
+
+var array<float> srHighs = array.new_float(0)
+var array<float> srLows  = array.new_float(0)
+var string srTicker = ""
+
+// STATE RESET on symbol change: these var arrays must never carry levels from
+// a previously loaded ticker. TradingView normally recalculates the whole
+// script when the symbol changes, which reinitialises them anyway - this
+// guard makes the contract explicit and holds in any context where it does
+// not. Stage 6 reuses the same pattern for the cooldown and performance state.
+if syminfo.ticker != srTicker
+    array.clear(srHighs)
+    array.clear(srLows)
+    srTicker := syminfo.ticker
+
+// Rolling FIFO window of the most recent confirmed pivots on each side.
+if not na(pivotHi)
+    array.push(srHighs, pivotHi)
+    if array.size(srHighs) > srKeep
+        array.shift(srHighs)
+if not na(pivotLo)
+    array.push(srLows, pivotLo)
+    if array.size(srLows) > srKeep
+        array.shift(srLows)
+
 // ============================================================================
 //  LAYER 1 - REGIME / TREND FILTER            (design weight 20)
 //  confidence = (# of met sub-conditions) / 3
@@ -448,6 +520,91 @@ f_volumeScore(float vol, float avg, float rLo, float cLo, float rHi, float cHi) 
     res
 
 // ============================================================================
+//  LAYER 6 - STRUCTURAL LEVEL PROXIMITY (S/R)  (design weight 10)
+//  Distance from price to the nearest confirmed pivot level, measured in ATR
+//  units so the layer behaves identically on a 12 TL bank and a 900 TL
+//  industrial:  <= srNearAtr (0.5 ATR) -> 1.0, >= srFarAtr (3 ATR) -> 0.0,
+//  linear in between.
+//
+//  WHICH LEVEL: direction-aware. A long is graded on its distance to the
+//  nearest level BELOW price (support it can lean on); a short on the nearest
+//  level ABOVE it. Either side may be an old pivot high or an old pivot low -
+//  a broken resistance that price now sits above is support, the classic
+//  polarity flip - so both arrays are searched on both sides.
+//
+//  HEADROOM (optional, ON by default): proximity alone would score a long
+//  pinned between support and resistance as highly as one with open sky
+//  above. When the opposing level is nearer than srHeadroomAtr the score is
+//  multiplied by srHeadroomMult. Turn the toggle off for plain spec
+//  behaviour.
+//
+//  NA GUARD: no confirmed pivot on the relevant side yet (warm-up, a new
+//  listing, or price beyond all known structure) -> neutral 0.5, never na.
+// ============================================================================
+
+// Nearest stored level at or below px (na if every level sits above it).
+// The array.size() > 0 guard is REQUIRED: Pine's for-loop counts DOWNWARD
+// when `to` is below `from`, so `0 to size - 1` on an empty array would
+// iterate rather than skip.
+f_maxBelow(array<float> a, float px) =>
+    float best = na
+    if array.size(a) > 0
+        for i = 0 to array.size(a) - 1
+            float v = array.get(a, i)
+            if not na(v) and v <= px and (na(best) or v > best)
+                best := v
+    best
+
+// Nearest stored level at or above px (na if every level sits below it).
+f_minAbove(array<float> a, float px) =>
+    float best = na
+    if array.size(a) > 0
+        for i = 0 to array.size(a) - 1
+            float v = array.get(a, i)
+            if not na(v) and v >= px and (na(best) or v < best)
+                best := v
+    best
+
+srBelowHi = f_maxBelow(srHighs, close)
+srBelowLo = f_maxBelow(srLows,  close)
+srSupport = na(srBelowHi) ? srBelowLo : (na(srBelowLo) ? srBelowHi : math.max(srBelowHi, srBelowLo))
+
+srAboveHi = f_minAbove(srHighs, close)
+srAboveLo = f_minAbove(srLows,  close)
+srResist  = na(srAboveHi) ? srAboveLo : (na(srAboveLo) ? srAboveHi : math.min(srAboveHi, srAboveLo))
+
+// Linear fade from 1.0 at nearU ATR to 0.0 at farU ATR. Kept as its own
+// helper so the mapping is defined once and can be reused. Bad anchors or a
+// dead ATR -> neutral 0.5.
+f_atrProximity(float dist, float atrv, float nearU, float farU) =>
+    float out = 0.5
+    if na(dist) or na(atrv) or atrv <= 0.0 or (farU - nearU) < 1e-10
+        out := 0.5
+    else
+        float d = dist / atrv
+        out := f_clamp(1.0 - (d - nearU) / (farU - nearU), 0.0, 1.0)
+    out
+
+f_srProximityScore(int dir, float px, float sup, float resist, float atrv, float nearU, float farU,
+     bool useHead, float headU, float headMult) =>
+    float out = 0.5
+    float anchor  = dir > 0 ? sup    : resist
+    float opposed = dir > 0 ? resist : sup
+    if na(px) or na(anchor) or na(atrv) or atrv <= 0.0
+        out := 0.5
+    else
+        // Both distances are non-negative by construction: `anchor` was
+        // selected from the correct side of price, and so was `opposed`.
+        float dist = dir > 0 ? px - anchor : anchor - px
+        out := f_atrProximity(dist, atrv, nearU, farU)
+        if useHead and not na(opposed)
+            float room = dir > 0 ? opposed - px : px - opposed
+            if room / atrv < headU
+                out := out * headMult
+        out := f_clamp(out, 0.0, 1.0)
+    out
+
+// ============================================================================
 //  SCORE AGGREGATION
 //  Both hypotheses are scored every bar; the stronger one becomes the
 //  candidate direction. Layers 1-4 are computed unconditionally (keeps ta.*
@@ -464,7 +621,13 @@ s3Short = f_momentumScore(-1, rsiVal, rsiMaVal, macdHist)
 
 s4Both  = f_volumeScore(volume, volAvg, volRatioLo, volConfLo, volRatioHi, volConfHi)
 
-f_aggregate(float c1, float c2, float c3, float c4) =>
+s6Long  = f_srProximityScore( 1, close, srSupport, srResist, atrVal, srNearAtr, srFarAtr,
+     srUseHeadroom, srHeadroomAtr, srHeadroomMult)
+s6Short = f_srProximityScore(-1, close, srSupport, srResist, atrVal, srNearAtr, srFarAtr,
+     srUseHeadroom, srHeadroomAtr, srHeadroomMult)
+
+// No c5 parameter: layer 5 is the hard veto and carries no weight.
+f_aggregate(float c1, float c2, float c3, float c4, float c6) =>
     float num = 0.0
     float den = 0.0
     if useL1
@@ -479,6 +642,9 @@ f_aggregate(float c1, float c2, float c3, float c4) =>
     if useL4
         num += c4 * wL4
         den += wL4
+    if useL6
+        num += c6 * wL6
+        den += wL6
     float outv = 0.0
     if normalizeWeights
         outv := den > 0.0 ? num / den * 100.0 : 0.0
@@ -486,8 +652,8 @@ f_aggregate(float c1, float c2, float c3, float c4) =>
         outv := num
     f_clamp(outv, 0.0, 100.0)
 
-longScore  = f_aggregate(s1Long,  s2Long,  s3Long,  s4Both)
-shortScore = f_aggregate(s1Short, s2Short, s3Short, s4Both)
+longScore  = f_aggregate(s1Long,  s2Long,  s3Long,  s4Both, s6Long)
+shortScore = f_aggregate(s1Short, s2Short, s3Short, s4Both, s6Short)
 
 // Candidate direction: +1 long, -1 short, 0 tie/flat.
 sigDir  = longScore > shortScore ? 1 : (shortScore > longScore ? -1 : 0)
