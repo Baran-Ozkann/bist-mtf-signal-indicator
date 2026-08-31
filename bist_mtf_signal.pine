@@ -13,7 +13,8 @@
 //  [x] Stage 5  Advanced layers 9-13
 //  [x] Stage 6  Cooldown + earnings blacklist
 //  [x] Stage 7  Visuals (plotshape, colour coding, score label)
-//  [x] Stage 8  Performance log panel                            <-- CURRENT
+//  [x] Stage 8  Performance log panel
+//  [x] Stage 8.5 Exit logic (positions, exit rules, comparison)  <-- CURRENT
 //  [ ] Stage 9  Unified alertcondition()
 //  [ ] Stage 10 End-to-end / repaint testing
 //
@@ -204,10 +205,14 @@ const string G_LOG  = "Performance Log"
 const string G_DISP = "Display"
 
 // ---------------------------------------------------------------- General ---
-scoreThreshold = input.int(70, "Signal score threshold", minval = 1, maxval = 100, group = G_GEN,
-     tooltip = "The score a candidate must reach before the entry timeframe is consulted at " +
-     "all. Already live: it drives the scoreArmed gate. Stage 9 attaches the unified alert to " +
-     "the same crossing.")
+scoreThreshold = input.int(60, "Signal score threshold", minval = 1, maxval = 100, group = G_GEN,
+     tooltip = "The score a candidate must reach before the entry timeframe is consulted at all. " +
+     "It drives the scoreArmed gate, and Stage 9 attaches the unified alert to the same crossing.\n\n" +
+     "DEFAULT LOWERED 70 -> 60. Layers 9, 10 and 11 return a true zero on most bars by design, so " +
+     "roughly 15 of the 95 live weight points are structurally unavailable on an ordinary bar and " +
+     "70 was unreachable rather than merely strict - measured at 0.0% of bars on two large-cap " +
+     "names. Check the panel's SCORE REACH section on YOUR symbol before trusting any threshold: " +
+     "the peak row turns red when the setting is above anything the score has ever reached.")
 normalizeWeights = input.bool(true, "Renormalise score across ENABLED layers only", group = G_GEN,
      tooltip = "WEIGHT REDISTRIBUTION: total design weight is 100 across all 13 layers. " +
      "With this ON the score is divided by the sum of enabled weights, so it always spans 0-100. " +
@@ -628,6 +633,12 @@ panelShowReach = input.bool(true, "Panel: score reach distribution", group = G_L
      "sits below your threshold, the threshold is unreachable on this symbol and no amount of " +
      "waiting will produce a signal.")
 panelShowBands = input.bool(true, "Panel: win rate and excursions by band", group = G_LOG)
+panelShowModels = input.bool(true, "Panel: exit model comparison", group = G_LOG,
+     tooltip = "Fixed-R against structural against the exit-free control, all on the same signals " +
+     "and all quoted in the same R.")
+panelShowReasons = input.bool(true, "Panel: exit reason breakdown", group = G_LOG,
+     tooltip = "Which rule is actually doing the work in the LIVE model. A structural model where " +
+     "most exits come from the time stop is not a structural model.")
 panelShowDetail = input.bool(true, "Panel: last signals detail", group = G_LOG)
 panelDetailRows = input.int(10, "Panel: detail rows", minval = 1, maxval = 20, group = G_LOG)
 
@@ -2476,7 +2487,32 @@ var array<float> pbMfe  = array.new_float(4, 0.0)
 var array<float> pbMae  = array.new_float(4, 0.0)
 var array<int>   pbPend = array.new_int(4, 0)
 
+// Exit-model accumulators. 0 = horizon control, 1 = fixed-R, 2 = structural.
+var array<int>   pmN     = array.new_int(3, 0)
+var array<int>   pmWin   = array.new_int(3, 0)
+var array<float> pmR     = array.new_float(3, 0.0)
+var array<float> pmWinR  = array.new_float(3, 0.0)
+var array<float> pmLossR = array.new_float(3, 0.0)
+var array<int>   pmLoss  = array.new_int(3, 0)
+var array<int>   pmBars  = array.new_int(3, 0)
+var array<string> pmNames = array.from("HORIZON", "FIXED-R", "STRUCT")
+
+// Exit-reason accumulators, indexed by reason code 0-8.
+var array<int>   prN = array.new_int(9, 0)
+var array<float> prR = array.new_float(9, 0.0)
+
+// Scratch arrays for the suggested-multiple percentiles.
+var array<float> pcMae = array.new_float(0)
+var array<float> pcMfe = array.new_float(0)
+
 var table perfTable = na
+
+// The horizon track stores a percentage return; the exit tracks store R. This
+// converts the former into the latter exactly - ret% of entry IS the price
+// move - so all three rows of the comparison share one currency.
+f_retToR(float retPct, float entry, float atrAt, float stopMult) =>
+    na(retPct) or na(entry) or na(atrAt) or atrAt <= 0.0 or stopMult <= 0.0 ? na :
+     retPct / 100.0 * entry / (stopMult * atrAt)
 
 f_sigBand(float score) =>
     score >= 80.0 ? 0 : (score >= 60.0 ? 1 : (score >= 40.0 ? 2 : 3))
@@ -2521,8 +2557,10 @@ if barstate.islast
         // Row budget must match exactly what is written below: an out-of-range
         // table.cell is a runtime error, not a silent no-op.
         int nRows = 1
-        nRows := nRows + (panelShowReach ? 7 : 0)
+        nRows := nRows + (panelShowReach ? 8 : 0)
         nRows := nRows + (panelShowBands ? 6 : 0)
+        nRows := nRows + (panelShowModels ? 4 : 0)
+        nRows := nRows + (panelShowReasons ? 9 : 0)
         nRows := nRows + (panelShowDetail ? 1 + math.max(detailN, 1) : 0)
 
         perfTable := table.new(pPos, PANEL_COLS, nRows, border_width = 1,
@@ -2565,6 +2603,34 @@ if barstate.islast
             f_pcell(perfTable, 5, row, "threshold", cHead, pSize, text.align_right)
             f_pcell(perfTable, 6, row, str.tostring(scoreThreshold),
                  unreachable ? cLoss : cText, pSize, text.align_right)
+            row := row + 1
+
+            // Suggested E1 / E2 multiples, beside what is currently set.
+            // Computed from the HORIZON-bounded excursions, which is the only
+            // window independent of the stop being calibrated.
+            array.clear(pcMae)
+            array.clear(pcMfe)
+            if logN > 0
+                for i = 0 to logN - 1
+                    SigRec r = array.get(sigLog, i)
+                    if r.resolved and not na(r.atrAt) and r.atrAt > 0.0
+                        array.push(pcMae, r.mae / r.atrAt)
+                        array.push(pcMfe, r.mfe / r.atrAt)
+            float sugStop = array.size(pcMae) > 0 ?
+             array.percentile_linear_interpolation(pcMae, 75) : na
+            float sugTgt = array.size(pcMfe) > 0 ?
+             array.percentile_linear_interpolation(pcMfe, 50) : na
+
+            f_pcell(perfTable, 0, row, "suggest", cHead, pSize, text.align_left)
+            f_pcell(perfTable, 1, row, "stop", cHead, pSize, text.align_right)
+            f_pcell(perfTable, 2, row, na(sugStop) ? "-" : str.tostring(sugStop, "#.00"),
+                 cText, pSize, text.align_right)
+            f_pcell(perfTable, 3, row, "target", cHead, pSize, text.align_right)
+            f_pcell(perfTable, 4, row, na(sugTgt) ? "-" : str.tostring(sugTgt, "#.00"),
+                 cText, pSize, text.align_right)
+            f_pcell(perfTable, 5, row, "set", cHead, pSize, text.align_right)
+            f_pcell(perfTable, 6, row, str.tostring(exitStopATR, "#.0") + " / " +
+                 str.tostring(exitTargetATR, "#.0"), cText, pSize, text.align_right)
             row := row + 1
 
         // --------------------------------------------------------- BY BAND ---
@@ -2647,6 +2713,106 @@ if barstate.islast
                  text.align_right)
             f_pcell(perfTable, 6, row, str.tostring(allPend), cHead, pSize, text.align_right)
             row := row + 1
+
+        // ------------------------------------------------- BY EXIT MODEL ---
+        if panelShowModels
+            array.fill(pmN, 0)
+            array.fill(pmWin, 0)
+            array.fill(pmR, 0.0)
+            array.fill(pmWinR, 0.0)
+            array.fill(pmLossR, 0.0)
+            array.fill(pmLoss, 0)
+            array.fill(pmBars, 0)
+
+            if logN > 0
+                for i = 0 to logN - 1
+                    SigRec r = array.get(sigLog, i)
+                    for t = 0 to 2
+                        bool done = t == 0 ? r.resolved : (t == 1 ? r.fDone : r.sDone)
+                        float rr = t == 0 ? f_retToR(r.ret, r.entry, r.atrAt, exitStopATR) :
+                         (t == 1 ? r.fR : r.sR)
+                        int bars = t == 0 ? logHorizon : (t == 1 ? r.fBars : r.sBars)
+                        if done and not na(rr)
+                            array.set(pmN, t, array.get(pmN, t) + 1)
+                            array.set(pmR, t, array.get(pmR, t) + rr)
+                            array.set(pmBars, t, array.get(pmBars, t) + bars)
+                            if rr > 0.0
+                                array.set(pmWin, t, array.get(pmWin, t) + 1)
+                                array.set(pmWinR, t, array.get(pmWinR, t) + rr)
+                            else
+                                array.set(pmLoss, t, array.get(pmLoss, t) + 1)
+                                array.set(pmLossR, t, array.get(pmLossR, t) + rr)
+
+            f_pcell(perfTable, 0, row, "BY EXIT MODEL", cHead, pSize, text.align_left)
+            f_pcell(perfTable, 1, row, "n",        cHead, pSize, text.align_right)
+            f_pcell(perfTable, 2, row, "win%",     cHead, pSize, text.align_right)
+            f_pcell(perfTable, 3, row, "avg R",    cHead, pSize, text.align_right)
+            f_pcell(perfTable, 4, row, "avg win",  cHead, pSize, text.align_right)
+            f_pcell(perfTable, 5, row, "avg loss", cHead, pSize, text.align_right)
+            f_pcell(perfTable, 6, row, "bars",     cHead, pSize, text.align_right)
+            row := row + 1
+
+            for t = 0 to 2
+                int n = array.get(pmN, t)
+                float wr = n > 0 ? array.get(pmWin, t) / (n * 1.0) * 100.0 : na
+                float avgR = n > 0 ? array.get(pmR, t) / n : na
+                bool isLive = (t == 1 and not liveStructural) or (t == 2 and liveStructural)
+                f_pcell(perfTable, 0, row, array.get(pmNames, t) + (isLive ? " *" : ""),
+                     isLive ? cHead : cText, pSize, text.align_left)
+                f_pcell(perfTable, 1, row, str.tostring(n), cText, pSize, text.align_right)
+                f_pcell(perfTable, 2, row, n > 0 ? str.tostring(wr, "#.0") + "%" : "-",
+                     n > 0 ? (wr >= 50.0 ? cWin : cLoss) : cText, pSize, text.align_right)
+                // avg R is the expectancy: it already folds win rate and payoff
+                // together, and it is the column that decides between models.
+                f_pcell(perfTable, 3, row, f_signed(avgR, "#.00"),
+                     na(avgR) ? cText : (avgR > 0.0 ? cWin : cLoss), pSize, text.align_right)
+                f_pcell(perfTable, 4, row,
+                     f_avgStr(array.get(pmWinR, t), array.get(pmWin, t), "#.00"),
+                     cText, pSize, text.align_right)
+                f_pcell(perfTable, 5, row,
+                     f_avgStr(array.get(pmLossR, t), array.get(pmLoss, t), "#.00"),
+                     cText, pSize, text.align_right)
+                f_pcell(perfTable, 6, row, n > 0 ?
+                     str.tostring(array.get(pmBars, t) / (n * 1.0), "#.0") : "-",
+                     cText, pSize, text.align_right)
+                row := row + 1
+
+        // ------------------------------------------------ BY EXIT REASON ---
+        if panelShowReasons
+            array.fill(prN, 0)
+            array.fill(prR, 0.0)
+            int reasonTotal = 0
+
+            if logN > 0
+                for i = 0 to logN - 1
+                    SigRec r = array.get(sigLog, i)
+                    bool done = liveStructural ? r.sDone : r.fDone
+                    int rsn = liveStructural ? r.sReason : r.fReason
+                    float rr = liveStructural ? r.sR : r.fR
+                    if done and rsn >= 1 and rsn <= 8
+                        array.set(prN, rsn, array.get(prN, rsn) + 1)
+                        array.set(prR, rsn, array.get(prR, rsn) + nz(rr))
+                        reasonTotal := reasonTotal + 1
+
+            f_pcell(perfTable, 0, row, "EXIT REASON", cHead, pSize, text.align_left)
+            f_pcell(perfTable, 1, row, liveStructural ? "structural" : "fixed-R", cHead, pSize,
+                 text.align_right)
+            f_pcell(perfTable, 2, row, "n",     cHead, pSize, text.align_right)
+            f_pcell(perfTable, 3, row, "share", cHead, pSize, text.align_right)
+            f_pcell(perfTable, 4, row, "avg R", cHead, pSize, text.align_right)
+            row := row + 1
+
+            for rsn = 1 to 8
+                int n = array.get(prN, rsn)
+                float avgR = n > 0 ? array.get(prR, rsn) / n : na
+                f_pcell(perfTable, 0, row, "E" + str.tostring(rsn), cText, pSize, text.align_left)
+                f_pcell(perfTable, 1, row, f_exitName(rsn), cText, pSize, text.align_right)
+                f_pcell(perfTable, 2, row, str.tostring(n), cText, pSize, text.align_right)
+                f_pcell(perfTable, 3, row, f_pctStr(n, reasonTotal), cText, pSize,
+                     text.align_right)
+                f_pcell(perfTable, 4, row, f_signed(avgR, "#.00"),
+                     na(avgR) ? cText : (avgR > 0.0 ? cWin : cLoss), pSize, text.align_right)
+                row := row + 1
 
         // ---------------------------------------------------- LAST SIGNALS ---
         if panelShowDetail
