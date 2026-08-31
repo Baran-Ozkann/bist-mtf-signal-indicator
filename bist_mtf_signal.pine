@@ -168,6 +168,7 @@ const string G_L6   = "Layer 6 - Structural Level Proximity (S/R)"
 const string G_L7   = "Layer 7 - Volatility Regime (ATR)"
 const string G_L8   = "Layer 8 - Market / Index Correlation"
 const string G_L9   = "Layer 9 - Liquidity Sweep"
+const string G_L10  = "Layer 10 - RSI / Price Divergence"
 const string G_ENT  = "Entry Timing (1h)"
 const string G_EXH  = "Exhaustion Gate (15m)"
 const string G_DISP = "Display"
@@ -338,6 +339,29 @@ sweepFloorConf = input.float(0.4, "Confidence at the oldest allowed bar", minval
      tooltip = "Confidence decays linearly from 1.0 on the sweep bar itself to this value at the " +
      "edge of the window above.")
 
+// --------------------------------------------------------------- Layer 10 ---
+useL10 = input.bool(true, "Enable Layer 10", group = G_L10)
+wL10   = input.float(5.0, "Weight", minval = 0.0, maxval = 100.0, step = 0.5, group = G_L10)
+divLeft = input.int(5, "Divergence pivot leftbars", minval = 1, maxval = 50, group = G_L10,
+     tooltip = "LOOKBACK JUSTIFICATION - leftbars = 5: the same swing context layer 6 uses, so the " +
+     "turning points the two layers talk about are comparable in size.")
+divRight = input.int(3, "Divergence pivot rightbars", minval = 1, maxval = 50, group = G_L10,
+     tooltip = "LOOKBACK JUSTIFICATION - rightbars = 3, one MORE than layer 6 uses. A divergence " +
+     "claim rests entirely on the pivot being a genuine turning point, so it is worth an extra bar " +
+     "of confirmation lag to discard marginal pivots that reverse again immediately. As with every " +
+     "pivot in this script the value publishes only after those bars have closed, so the level can " +
+     "never shift on the realtime bar.")
+divMaxAge = input.int(10, "Divergence valid for N bars after the pivot", minval = 0, maxval = 200,
+     group = G_L10,
+     tooltip = "A divergence that formed twenty bars ago and has not resolved is no longer a " +
+     "signal. Confidence decays linearly across this window.")
+divMinRsiGap = input.float(1.0, "Minimum RSI gap between the two pivots (points)", minval = 0.0,
+     step = 0.5, group = G_L10,
+     tooltip = "How far RSI must disagree with price before it counts. Without a gap, a 0.01-point " +
+     "difference would register as a divergence.")
+divFloorConf = input.float(0.3, "Confidence at the oldest allowed bar", minval = 0.0, maxval = 1.0,
+     step = 0.05, group = G_L10)
+
 // ------------------------------------------------- Entry timing (1h) ---
 useEntryTiming = input.bool(true, "Enable 1h entry timing", group = G_ENT,
      tooltip = "Once the signal-timeframe score crosses the threshold, the entry timeframe must " +
@@ -490,17 +514,47 @@ pivotLo = ta.pivotlow(low,   srLeft, srRight)
 
 var array<float> srHighs = array.new_float(0)
 var array<float> srLows  = array.new_float(0)
+
+// ------------------------------------- Confirmed pivots for divergence ---
+// Layer 10 keeps its OWN pivot pair rather than reusing layer 6's, because
+// the two layers want different confirmation strictness - see the lookback
+// justification in the layer 10 tooltips.
+divPivotHi = ta.pivothigh(high, divLeft, divRight)
+divPivotLo = ta.pivotlow(low,   divLeft, divRight)
+
+// The two most recent confirmed pivots per side, each paired with the RSI
+// reading taken AT THE PIVOT BAR. Suffix 1 is the most recent, 2 the one
+// before it - a divergence needs exactly that pair.
+var float divPxHi1  = na
+var float divPxHi2  = na
+var float divRsiHi1 = na
+var float divRsiHi2 = na
+var float divPxLo1  = na
+var float divPxLo2  = na
+var float divRsiLo1 = na
+var float divRsiLo2 = na
+
 var string srTicker = ""
 
-// STATE RESET on symbol change: these var arrays must never carry levels from
-// a previously loaded ticker. TradingView normally recalculates the whole
-// script when the symbol changes, which reinitialises them anyway - this
-// guard makes the contract explicit and holds in any context where it does
-// not. Stage 6 reuses the same pattern for the cooldown and performance state.
+// STATE RESET on symbol change: none of this var state - pivot levels or
+// divergence pivots - may carry over from a previously loaded ticker. Prices
+// from another instrument would be meaningless as levels and actively
+// misleading as divergence anchors. TradingView normally recalculates the
+// whole script when the symbol changes, which reinitialises everything
+// anyway; this guard makes the contract explicit and holds in any context
+// where it does not. Stage 6 reuses the pattern for cooldown and log state.
 if syminfo.ticker != srTicker
     array.clear(srHighs)
     array.clear(srLows)
-    srTicker := syminfo.ticker
+    divPxHi1  := na
+    divPxHi2  := na
+    divRsiHi1 := na
+    divRsiHi2 := na
+    divPxLo1  := na
+    divPxLo2  := na
+    divRsiLo1 := na
+    divRsiLo2 := na
+    srTicker  := syminfo.ticker
 
 // Rolling FIFO window of the most recent confirmed pivots on each side.
 if not na(pivotHi)
@@ -511,6 +565,28 @@ if not na(pivotLo)
     array.push(srLows, pivotLo)
     if array.size(srLows) > srKeep
         array.shift(srLows)
+
+// Shift the divergence history when a new pivot confirms. The RSI reading is
+// taken divRight bars back, which is the PIVOT bar - not the confirmation
+// bar we are standing on. Pairing the pivot price with an RSI value from a
+// different bar is the classic way to manufacture divergences that were
+// never there.
+if not na(divPivotHi)
+    divPxHi2  := divPxHi1
+    divRsiHi2 := divRsiHi1
+    divPxHi1  := divPivotHi
+    divRsiHi1 := rsiVal[divRight]
+if not na(divPivotLo)
+    divPxLo2  := divPxLo1
+    divRsiLo2 := divRsiLo1
+    divPxLo1  := divPivotLo
+    divRsiLo1 := rsiVal[divRight]
+
+// Bars since the most recent confirmed pivot published, for the freshness
+// decay. na until the first pivot of that kind exists - the score function
+// guards for it.
+divBarsSinceHi = ta.barssince(not na(divPivotHi))
+divBarsSinceLo = ta.barssince(not na(divPivotLo))
 
 // ============================================================================
 //  LAYER 1 - REGIME / TREND FILTER            (design weight 20)
@@ -858,6 +934,46 @@ f_liquiditySweepScore(int dir, array<float> hiLvls, array<float> loLvls, simple 
     out
 
 // ============================================================================
+//  LAYER 10 - RSI / PRICE DIVERGENCE           (design weight 5)
+//  Classic divergence between the last two CONFIRMED pivots on one side:
+//    LONG  (bullish) : price made a lower low, RSI made a higher low.
+//    SHORT (bearish) : price made a higher high, RSI made a lower high.
+//
+//  CONFIRMED PIVOTS ONLY: divPivotHi/divPivotLo publish divRight bars after
+//  the pivot bar, so neither anchor can move once it has been recorded. An
+//  unconfirmed "live" pivot would let a divergence appear and vanish on the
+//  realtime bar, which is the single most common way divergence indicators
+//  repaint.
+//
+//  RSI IS SAMPLED AT THE PIVOT BAR (rsiVal[divRight]), not at the bar where
+//  the pivot was confirmed.
+//
+//  NA GUARD: fewer than two confirmed pivots on the relevant side - a new
+//  listing, a short history, or simply early in the chart - returns neutral
+//  0.5. A divergence that exists but has aged past divMaxAge returns 0.0,
+//  as does no divergence at all: both are known negatives, not unknowns.
+// ============================================================================
+f_divergenceScore(int dir, float px1, float px2, float rsi1, float rsi2, int barsSince,
+     simple int maxAge, float minGap, float floorConf) =>
+    float out = 0.0
+    if na(px1) or na(px2) or na(rsi1) or na(rsi2) or na(barsSince)
+        out := 0.5
+    else
+        // dir > 0 reads the pivot LOWS, dir < 0 the pivot HIGHS; the caller
+        // passes the matching pair, so the test here is symmetric.
+        bool priceOk = dir > 0 ? px1 < px2 : px1 > px2
+        bool rsiOk   = dir > 0 ? rsi1 >= rsi2 + minGap : rsi1 <= rsi2 - minGap
+        if not (priceOk and rsiOk)
+            out := 0.0
+        else if barsSince > maxAge
+            out := 0.0
+        else if maxAge <= 0
+            out := 1.0
+        else
+            out := f_clamp(1.0 - (1.0 - floorConf) * barsSince / maxAge, 0.0, 1.0)
+    out
+
+// ============================================================================
 //  SCORE AGGREGATION
 //  Both hypotheses are scored every bar; the stronger one becomes the
 //  candidate direction. Every layer is computed unconditionally (keeps ta.*
@@ -891,9 +1007,14 @@ s9Long  = f_liquiditySweepScore( 1, srHighs, srLows, sweepMaxAge, atrVal, sweepM
 s9Short = f_liquiditySweepScore(-1, srHighs, srLows, sweepMaxAge, atrVal, sweepMinPierce,
      sweepFloorConf)
 
+s10Long  = f_divergenceScore( 1, divPxLo1, divPxLo2, divRsiLo1, divRsiLo2, divBarsSinceLo,
+     divMaxAge, divMinRsiGap, divFloorConf)
+s10Short = f_divergenceScore(-1, divPxHi1, divPxHi2, divRsiHi1, divRsiHi2, divBarsSinceHi,
+     divMaxAge, divMinRsiGap, divFloorConf)
+
 // No c5 parameter: layer 5 is the hard veto and carries no weight.
 f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8,
-     float c9) =>
+     float c9, float c10) =>
     float num = 0.0
     float den = 0.0
     if useL1
@@ -920,6 +1041,9 @@ f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8
     if useL9
         num += c9 * wL9
         den += wL9
+    if useL10
+        num += c10 * wL10
+        den += wL10
     float outv = 0.0
     if normalizeWeights
         outv := den > 0.0 ? num / den * 100.0 : 0.0
@@ -928,9 +1052,9 @@ f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8
     f_clamp(outv, 0.0, 100.0)
 
 longScore  = f_aggregate(s1Long,  s2Long,  s3Long,  s4Both, s6Long,  s7Both, s8Long,
-     s9Long)
+     s9Long,  s10Long)
 shortScore = f_aggregate(s1Short, s2Short, s3Short, s4Both, s6Short, s7Both, s8Short,
-     s9Short)
+     s9Short, s10Short)
 
 // Candidate direction: +1 long, -1 short, 0 tie/flat.
 sigDir  = longScore > shortScore ? 1 : (shortScore > longScore ? -1 : 0)
