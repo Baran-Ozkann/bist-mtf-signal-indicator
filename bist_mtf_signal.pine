@@ -2107,8 +2107,14 @@ f_ablSignal(float numL, float numS, float den, float wk, float ckL, float ckS,
      bool layerOn, float thr, bool vetoOn, int bias,
      bool touchL, bool touchS, bool confL, bool confS, bool entryOn,
      bool exhL, bool exhS, bool exhOn, bool cdOn, simple int cdBars) =>
-    var int lastLong  = na
-    var int lastShort = na
+    var int  lastLong  = na
+    var int  lastShort = na
+    // The previous bar's gate state, held explicitly rather than read as
+    // sig[1]. A `var` local is per-call-site and unambiguously supported;
+    // history-referencing a local is the murkier construct, and this block has
+    // fourteen call sites riding on it. Updated unconditionally at the end of
+    // the function on every bar, so it is exactly equivalent.
+    var bool prevSig = false
     // A layer the user has already disabled contributes nothing to either the
     // numerator or the denominator, so there is nothing to remove: layerOn
     // false leaves the stream identical to BASE, and the panel prints "off"
@@ -2130,7 +2136,7 @@ f_ablSignal(float numL, float numS, float den, float wk, float ckL, float ckS,
     bool ready = armed and (not entryOn or
      ((fdir > 0 ? touchL : touchS) and (fdir > 0 ? confL : confS)))
     bool sig   = ready and (not exhOn or (fdir > 0 ? exhL : exhS))
-    bool fresh = sig and not sig[1]
+    bool fresh = sig and not prevSig
     int  last  = fdir > 0 ? lastLong : lastShort
     bool cdOk  = not cdOn or na(last) or (bar_index - last) >= cdBars
     bool acc   = fresh and cdOk
@@ -2139,6 +2145,7 @@ f_ablSignal(float numL, float numS, float den, float wk, float ckL, float ckS,
             lastLong := bar_index
         else
             lastShort := bar_index
+    prevSig := sig
     [acc, fdir]
 
 // The fourteen streams. BASE passes layerOn = false with a zero weight, so it
