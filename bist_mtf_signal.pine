@@ -141,6 +141,7 @@ const string G_L3   = "Layer 3 - Momentum (RSI + MACD)"
 const string G_L4   = "Layer 4 - Volume Confirmation"
 const string G_L5   = "Layer 5 - 1D Directional Lock (hard veto)"
 const string G_L6   = "Layer 6 - Structural Level Proximity (S/R)"
+const string G_L7   = "Layer 7 - Volatility Regime (ATR)"
 const string G_ENT  = "Entry Timing (1h)"
 const string G_EXH  = "Exhaustion Gate (15m)"
 const string G_DISP = "Display"
@@ -246,6 +247,30 @@ srHeadroomAtr = input.float(0.5, "Headroom threshold (ATR units)", minval = 0.0,
      group = G_L6)
 srHeadroomMult = input.float(0.5, "Headroom penalty multiplier", minval = 0.0, maxval = 1.0,
      step = 0.05, group = G_L6)
+
+// ---------------------------------------------------------------- Layer 7 ---
+useL7 = input.bool(true, "Enable Layer 7", group = G_L7)
+wL7   = input.float(5.0, "Weight", minval = 0.0, maxval = 100.0, step = 0.5, group = G_L7)
+atrAvgLen = input.int(50, "ATR baseline SMA length", minval = 2, group = G_L7,
+     tooltip = "The recent average ATR is compared with the current ATR. Long enough to describe " +
+     "the ticker's normal volatility, short enough to still track a regime change.")
+atrRatioLo = input.float(0.8, "Low anchor: ATR / baseline", minval = 0.0, step = 0.05, group = G_L7)
+atrConfLo  = input.float(0.2, "Low anchor: confidence", minval = 0.0, maxval = 1.0, step = 0.05,
+     group = G_L7)
+atrRatioHi = input.float(1.5, "High anchor: ATR / baseline", minval = 0.1, step = 0.05, group = G_L7)
+atrConfHi  = input.float(1.0, "High anchor: confidence", minval = 0.0, maxval = 1.0, step = 0.05,
+     group = G_L7)
+atrSlopeLb = input.int(5, "Slope lookback (bars)", minval = 1, maxval = 100, group = G_L7,
+     tooltip = "Current ATR is also compared with the ATR this many bars ago, so a range that is " +
+     "already wide but no longer widening scores below one that is actively expanding.")
+atrSlopeBand = input.float(0.05, "Slope deadband (fraction)", minval = 0.0, maxval = 1.0,
+     step = 0.01, group = G_L7,
+     tooltip = "ATR within this fraction of its value `Slope lookback` bars ago counts as flat " +
+     "(0.5). Below the band -> contracting (0.0), above it -> expanding (1.0), linear between.")
+atrSlopeWeight = input.float(0.3, "Slope sub-weight", minval = 0.0, maxval = 1.0, step = 0.05,
+     group = G_L7,
+     tooltip = "Split of the layer between the two tests: this much on the slope, the remainder on " +
+     "the level. 0.0 grades the level only, 1.0 the slope only.")
 
 // ------------------------------------------------- Entry timing (1h) ---
 useEntryTiming = input.bool(true, "Enable 1h entry timing", group = G_ENT,
@@ -383,6 +408,7 @@ rsiMaVal = ta.sma(rsiVal, rsiSmoothLen)
 volAvg = ta.sma(volume, volLen)                          // real volume
 
 atrVal = ta.atr(atrLen)                                  // real OHLC (true range)
+atrAvg = ta.sma(atrVal, atrAvgLen)                       // layer 7 baseline
 
 // ------------------------------------------- Confirmed pivot S/R levels ---
 // REAL high/low deliberately, not the HA-aware source: a support or
@@ -605,6 +631,55 @@ f_srProximityScore(int dir, float px, float sup, float resist, float atrv, float
     out
 
 // ============================================================================
+//  LAYER 7 - VOLATILITY REGIME (ATR)           (design weight 5)
+//  Is volatility expanding or contracting relative to its own recent norm?
+//  Expansion raises breakout confidence; a compressing range means any
+//  breakout signal is more likely to stall inside the noise.
+//
+//  Two tests, blended by atrSlopeWeight (default 0.3 slope / 0.7 level):
+//    LEVEL : ATR / SMA(ATR, atrAvgLen), mapped through the two anchors
+//            (default 0.8x -> 0.20, 1.5x -> 1.00). Answers "is the range wide
+//            for this ticker right now?"
+//    SLOPE : ATR / ATR[atrSlopeLb], mapped through a deadband centred on 1.0.
+//            Answers "is it still widening?" - a range that is already wide
+//            but has stopped expanding is a worse breakout backdrop than one
+//            actively opening up.
+//
+//  NON-DIRECTIONAL: expansion favours a breakout either way, so the long and
+//  short hypotheses receive the same confidence (as with layer 4).
+//
+//  DIV-BY-ZERO / NA GUARDS: a na or non-positive ATR, baseline, or historical
+//  ATR yields neutral 0.5 for the affected sub-test rather than na - which
+//  is what happens during warm-up on a newly listed ticker, and on a halted
+//  name whose true range collapses to zero.
+// ============================================================================
+
+// Generic two-anchor linear map with clamping to the anchor range. Degenerate
+// anchors (xHi == xLo) or a na input -> neutral 0.5.
+f_mapLinear(float v, float xLo, float yLo, float xHi, float yHi) =>
+    float out = 0.5
+    if na(v) or math.abs(xHi - xLo) < 1e-10
+        out := 0.5
+    else
+        float raw = yLo + (v - xLo) * (yHi - yLo) / (xHi - xLo)
+        out := f_clamp(raw, math.min(yLo, yHi), math.max(yLo, yHi))
+    out
+
+f_volatilityScore(float atrv, float baseline, float atrPast, float rLo, float cLo, float rHi,
+     float cHi, float band, float slopeW) =>
+    float out = 0.5
+    if na(atrv) or atrv <= 0.0
+        out := 0.5
+    else
+        float lvl = na(baseline) or baseline <= 0.0 ? 0.5 :
+         f_mapLinear(atrv / baseline, rLo, cLo, rHi, cHi)
+        float slp = na(atrPast) or atrPast <= 0.0 ? 0.5 :
+         f_mapLinear(atrv / atrPast, 1.0 - band, 0.0, 1.0 + band, 1.0)
+        float w = f_clamp(slopeW, 0.0, 1.0)
+        out := f_clamp((1.0 - w) * lvl + w * slp, 0.0, 1.0)
+    out
+
+// ============================================================================
 //  SCORE AGGREGATION
 //  Both hypotheses are scored every bar; the stronger one becomes the
 //  candidate direction. Layers 1-4 are computed unconditionally (keeps ta.*
@@ -626,8 +701,11 @@ s6Long  = f_srProximityScore( 1, close, srSupport, srResist, atrVal, srNearAtr, 
 s6Short = f_srProximityScore(-1, close, srSupport, srResist, atrVal, srNearAtr, srFarAtr,
      srUseHeadroom, srHeadroomAtr, srHeadroomMult)
 
+s7Both  = f_volatilityScore(atrVal, atrAvg, atrVal[atrSlopeLb], atrRatioLo, atrConfLo,
+     atrRatioHi, atrConfHi, atrSlopeBand, atrSlopeWeight)
+
 // No c5 parameter: layer 5 is the hard veto and carries no weight.
-f_aggregate(float c1, float c2, float c3, float c4, float c6) =>
+f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7) =>
     float num = 0.0
     float den = 0.0
     if useL1
@@ -645,6 +723,9 @@ f_aggregate(float c1, float c2, float c3, float c4, float c6) =>
     if useL6
         num += c6 * wL6
         den += wL6
+    if useL7
+        num += c7 * wL7
+        den += wL7
     float outv = 0.0
     if normalizeWeights
         outv := den > 0.0 ? num / den * 100.0 : 0.0
@@ -652,8 +733,8 @@ f_aggregate(float c1, float c2, float c3, float c4, float c6) =>
         outv := num
     f_clamp(outv, 0.0, 100.0)
 
-longScore  = f_aggregate(s1Long,  s2Long,  s3Long,  s4Both, s6Long)
-shortScore = f_aggregate(s1Short, s2Short, s3Short, s4Both, s6Short)
+longScore  = f_aggregate(s1Long,  s2Long,  s3Long,  s4Both, s6Long,  s7Both)
+shortScore = f_aggregate(s1Short, s2Short, s3Short, s4Both, s6Short, s7Both)
 
 // Candidate direction: +1 long, -1 short, 0 tie/flat.
 sigDir  = longScore > shortScore ? 1 : (shortScore > longScore ? -1 : 0)
