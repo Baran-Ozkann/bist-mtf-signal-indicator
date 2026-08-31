@@ -192,6 +192,7 @@ const string G_L12  = "Layer 12 - USDTRY Correlation (optional)"
 const string G_L13  = "Layer 13 - Session / Time Filter"
 const string G_ENT  = "Entry Timing (1h)"
 const string G_EXH  = "Exhaustion Gate (15m)"
+const string G_CD   = "Cooldown (Anti-Whipsaw)"
 const string G_DISP = "Display"
 
 // ---------------------------------------------------------------- General ---
@@ -487,6 +488,17 @@ pinMaxBody = input.float(0.35, "Pin bar: max body / range", minval = 0.01, maxva
 pinMinWick = input.float(2.0, "Pin bar: min wick / body", minval = 0.5, step = 0.1, group = G_EXH)
 exhaustConfirmedOnly = input.bool(true, "Exhaustion TF: use last CLOSED bar only", group = G_EXH)
 
+// --------------------------------------------------------------- Cooldown ---
+useCooldown = input.bool(true, "Enable cooldown", group = G_CD,
+     tooltip = "Anti-whipsaw. After a signal fires, further signals in the SAME direction are " +
+     "suppressed until the cooldown expires. The opposite direction is never blocked - a genuine " +
+     "reversal must always be allowed to signal immediately.")
+cooldownBars = input.int(4, "Bars before a new signal in the same direction", minval = 0,
+     maxval = 500, group = G_CD,
+     tooltip = "Counted in bars of the CHART timeframe, so the wall-clock length of the cooldown " +
+     "follows whatever timeframe you run the indicator on. 0 disables the wait without disabling " +
+     "the tracking.")
+
 // ---------------------------------------------------------------- Display ---
 showComponents = input.bool(false, "Plot long / short component scores", group = G_DISP)
 showRawScore   = input.bool(false, "Plot raw pre-veto score", group = G_DISP)
@@ -624,18 +636,28 @@ var float divPxLo2  = na
 var float divRsiLo1 = na
 var float divRsiLo2 = na
 
+// ------------------------------------------------ Cooldown state (Stage 6) ---
+// Chart bar_index of the last ACCEPTED signal per direction: slot 0 = long,
+// slot 1 = short. Held as an array rather than two scalars so the whole of
+// this script's persistent state resets through one code path below, and so
+// Stage 8's log can extend the same pattern. na = no signal yet this symbol.
+var array<int> cdLastSignalBar = array.new_int(2, na)
+
 var string srTicker = ""
 
-// STATE RESET on symbol change: none of this var state - pivot levels or
-// divergence pivots - may carry over from a previously loaded ticker. Prices
-// from another instrument would be meaningless as levels and actively
-// misleading as divergence anchors. TradingView normally recalculates the
-// whole script when the symbol changes, which reinitialises everything
-// anyway; this guard makes the contract explicit and holds in any context
-// where it does not. Stage 6 reuses the pattern for cooldown and log state.
+// STATE RESET on symbol change: none of this var state - pivot levels,
+// divergence anchors or cooldown timestamps - may carry over from a
+// previously loaded ticker. Prices from another instrument would be
+// meaningless as levels and actively misleading as divergence anchors, and a
+// stale bar_index would suppress the new symbol's first signal for no reason.
+// TradingView normally recalculates the whole script when the symbol changes,
+// which reinitialises everything anyway; this guard makes the contract
+// explicit and holds in any context where it does not. Stage 8's log will
+// reset through this same block.
 if syminfo.ticker != srTicker
     array.clear(srHighs)
     array.clear(srLows)
+    array.fill(cdLastSignalBar, na)
     divPxHi1  := na
     divPxHi2  := na
     divRsiHi1 := na
@@ -1444,11 +1466,31 @@ totalScore = vetoPassed ? rawScore : 0.0
 finalDir   = vetoPassed ? sigDir   : 0
 
 // ============================================================================
-//  SIGNAL ASSEMBLY - three sequential gates
+//  CONTROL MECHANISMS (Stage 6)
+// ============================================================================
+
+// ------------------------------------------------- Cooldown (anti-whipsaw) ---
+// "No new signal in the same direction until N bars pass since the last one."
+// Per direction, deliberately: a long followed immediately by a short is a
+// reversal, not whipsaw, and blocking it would hide exactly the trade the
+// user most needs to see.
+f_cooldownClear(array<int> lastBars, int dir, int nowBar, simple int bars) =>
+    bool ok = true
+    if dir == 0 or na(nowBar)
+        ok := false
+    else
+        int last = array.get(lastBars, dir > 0 ? 0 : 1)
+        // na = nothing has fired yet on this symbol, so nothing to wait for.
+        ok := na(last) or (nowBar - last) >= bars
+    ok
+
+// ============================================================================
+//  SIGNAL ASSEMBLY - four sequential gates
 // ============================================================================
 //  scoreArmed  : post-veto score crossed the threshold with a locked direction
 //  entryReady  : entry timeframe shows a PAC touch AND a confirmation candle
 //  entrySignal : exhaustion gate has opened in the same direction
+//  cooldown    : no accepted signal in this direction within the last N bars
 //  Each stage can be disabled independently, in which case it passes through.
 // ============================================================================
 scoreArmed = totalScore >= scoreThreshold and finalDir != 0
@@ -1461,9 +1503,28 @@ exhaustOk   = finalDir > 0 ? exhaustLong : exhaustShort
 exhaustWhy  = finalDir > 0 ? exhReasonL  : exhReasonS
 entrySignal = entryReady and (not useExhaustGate or exhaustOk)
 
-// Fires on the bar the gate opens, not on every bar it stays open. Stage 6
-// adds the cooldown; Stage 9 attaches the alert to this.
-entrySignalFresh = entrySignal and not entrySignal[1]
+// Rising edge of the gate stack: the bar the setup completes, not every bar
+// it stays complete.
+entryFreshRaw = entrySignal and not entrySignal[1]
+
+// The cooldown is evaluated BEFORE this bar's acceptance is recorded, so a
+// signal never blocks itself.
+cooldownClear = not useCooldown or f_cooldownClear(cdLastSignalBar, finalDir, bar_index,
+     cooldownBars)
+
+// The accepted signal. Stage 9 attaches the unified alert to this.
+entrySignalFresh = entryFreshRaw and cooldownClear
+
+// Diagnostic: a setup that completed but was refused by the cooldown.
+cooldownBlocked = entryFreshRaw and not cooldownClear
+
+// Record the acceptance. A setup refused here must go quiet and re-form to
+// signal again - the cooldown does not queue a blocked signal and release it
+// when the timer expires, because by then the setup that produced it is
+// stale. Pine re-runs the current bar from the last committed state on every
+// realtime tick, so an intrabar flicker cannot leave a false entry behind.
+if entrySignalFresh and finalDir != 0
+    array.set(cdLastSignalBar, finalDir > 0 ? 0 : 1, bar_index)
 
 // ============================================================================
 //  PLOTS  (minimal, plot()/hline() only - no plotshape, no colour
@@ -1483,6 +1544,8 @@ plot(showGates and entryReady  ? 60 : na, "Entry Ready", color = color.new(color
      style = plot.style_stepline)
 plot(showGates and entrySignal ? 90 : na, "Entry Signal", color = color.new(color.fuchsia, 10),
      style = plot.style_stepline)
+plot(showGates and cooldownBlocked ? 100 : na, "Cooldown Blocked",
+     color = color.new(color.red, 0), style = plot.style_stepline)
 
 hline(scoreThreshold, "Threshold", color = color.new(color.gray, 40), linestyle = hline.style_dashed)
 hline(80, "Band 80", color = color.new(color.gray, 80), linestyle = hline.style_dotted)
