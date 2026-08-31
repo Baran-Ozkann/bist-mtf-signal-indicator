@@ -637,9 +637,25 @@ exitMaxBars = input.int(250, "E8 max bars held", minval = 1, maxval = 500, group
      "resolve long before it - so raising it only frees the structural model to hold.")
 
 // -------------------------------------------------------- Performance log ---
-logMaxSignals = input.int(25, "Signals kept in the log", minval = 5, maxval = 100, group = G_LOG,
+logMaxSignals = input.int(100, "Signals kept in the log", minval = 5, maxval = 300, group = G_LOG,
      tooltip = "Rolling window of the most recent accepted signals. Older ones are dropped, so the " +
-     "win rates describe recent behaviour rather than the whole chart's history.")
+     "win rates describe recent behaviour rather than the whole chart's history.
+
+" +
+     "THIS IS THE ONLY SAMPLE CAP. Every signal statistic in the panel - the band breakdown, the " +
+     "exit-model comparison, the exit-reason shares and the suggested multiples - is computed by " +
+     "scanning this log, so this number sets the n behind all of them. The SCORE REACH section is " +
+     "the exception: it counts bars, not signals, and is never capped.
+
+" +
+     "It also bounds a quieter problem. A record is only dropped when the log overflows, but its " +
+     "exit tracks can still be open - E8 alone allows 250 bars - and a record dropped while " +
+     "pending is lost from the statistics silently. The window needs to be comfortably larger " +
+     "than the number of signals that fire inside one position's maximum lifetime.
+
+" +
+     "Cost of raising it: the per-bar update loop walks the whole log, so very large values add " +
+     "execution time on long histories.")
 logHorizon = input.int(10, "Outcome horizon (bars after signal)", minval = 1, maxval = 200,
      group = G_LOG,
      tooltip = "How many bars after a signal the outcome is measured. A signal younger than this " +
@@ -663,7 +679,9 @@ panelShowReasons = input.bool(true, "Panel: exit reason breakdown", group = G_LO
      tooltip = "Which rule is actually doing the work in the LIVE model. A structural model where " +
      "most exits come from the time stop is not a structural model.")
 panelShowDetail = input.bool(true, "Panel: last signals detail", group = G_LOG)
-panelDetailRows = input.int(10, "Panel: detail rows", minval = 1, maxval = 20, group = G_LOG)
+panelDetailRows = input.int(10, "Panel: detail rows", minval = 1, maxval = 50, group = G_LOG,
+     tooltip = "DISPLAY ONLY - how many individual signals the LAST SIGNALS section prints. It has " +
+     "no effect on any statistic; the sample behind the panel is set by 'Signals kept in the log'.")
 
 // ---------------------------------------------------------------- Display ---
 // TWO MASTER SWITCHES, per spec. Everything a trader acts on sits under the

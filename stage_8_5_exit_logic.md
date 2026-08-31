@@ -282,10 +282,23 @@ ones the user watched happen.
 - **Gross R only.** No commission, slippage, sizing or compounding. The panel
   measures exit quality, not account performance, and the difference matters
   most exactly where the numbers look best.
-- **Sample size.** The log holds the last 25 signals by default, split across
-  two models and four score bands. A win rate over a handful of resolved
-  trades is decoration rather than evidence. The panel prints `n` beside every
-  rate; read it first.
+- **Sample size.** The log holds the last 100 signals by default (raised from
+  25), split across two models and four score bands. A win rate over a handful
+  of resolved trades is decoration rather than evidence. The panel prints `n`
+  beside every rate; read it first.
+
+  `logMaxSignals` is the **only** cap on the signal statistics — the band
+  breakdown, exit-model comparison, exit-reason shares and suggested multiples
+  are all computed by scanning the log. *Score reach* is the exception: it
+  counts bars rather than signals and is never capped, which is why it can
+  answer the threshold question on a chart that has produced no signals at
+  all.
+
+  The window must also stay comfortably larger than the number of signals
+  that can fire within one position's maximum lifetime. A record is dropped
+  when the log overflows regardless of whether its exit tracks have resolved,
+  and a record dropped while pending leaves the statistics silently. With E8
+  at 250 bars, 25 was uncomfortably close to that boundary.
 - **Label budget.** `max_labels_count` is 500. On a long history the earliest
   exits lose their labels while their markers and panel records remain.
 
