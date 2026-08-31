@@ -577,8 +577,13 @@ exitGapFill = input.bool(true, "Gap through the stop fills at the bar open", gro
      "only: crediting the same price improvement on a target would flatter the result.")
 
 useE3 = input.bool(false, "E3 - trailing stop", group = G_EXIT,
-     tooltip = "OFF by default so the first fixed-R measurement is a clean two-rule model rather " +
-     "than three overlapping ones. Turn it on once you have a baseline to compare against.")
+     tooltip = "Available to BOTH models - it is the only rule that lets a position be HELD rather " +
+     "than closed, so binding it to one track left the structural model with nothing but exit " +
+     "rules and no way to ride a trend.\n\n" +
+     "On the structural track it is the trailing FLOOR: E4-E7 stay live as early-exit overrides " +
+     "and close the position first whenever the case for it dissolves.\n\n" +
+     "OFF by default so the fixed-R baseline stays the clean two-rule model it was measured as. " +
+     "See the trail geometry note in the position management block before setting the distance.")
 exitTrailATR = input.float(1.5, "E3 trail distance (ATR)", minval = 0.1, step = 0.1, group = G_EXIT,
      tooltip = "Distance held below the best price reached so far. The trail ratchets on CLOSED " +
      "bars only - see the note in the position management block.")
@@ -1837,13 +1842,18 @@ f_fixedExit(int dir, float stop, float trail, float target, bool eStop, bool eTr
         bool hitTrail  = eTrail  and not na(trail)  and (dir > 0 ? l <= trail  : h >= trail)
         bool hitTarget = eTarget and not na(target) and (dir > 0 ? h >= target : l <= target)
         if (hitStop or hitTrail) and (not hitTarget or stopFirst)
+            // When a bar takes out BOTH stops, the one nearer the price on the
+            // way out was reached first, and it is the one that closed the
+            // trade. Early in a position that is the hard stop; once the trail
+            // has ratcheted past it, it is the trail. Attributing such a bar to
+            // E1 by default would credit the wrong rule and book the worse of
+            // two fills - which understates exactly the rule being evaluated.
+            bool trailBinds = hitTrail and
+             (not hitStop or (dir > 0 ? trail > stop : trail < stop))
+            float lvl = trailBinds ? trail : stop
+            res.reason := trailBinds ? EXIT_TRAIL : EXIT_STOP
             // A bar that opened beyond the level never offered the level.
-            if hitStop
-                res.reason := EXIT_STOP
-                res.fill := gapFill ? (dir > 0 ? math.min(stop, o) : math.max(stop, o)) : stop
-            else
-                res.reason := EXIT_TRAIL
-                res.fill := gapFill ? (dir > 0 ? math.min(trail, o) : math.max(trail, o)) : trail
+            res.fill := gapFill ? (dir > 0 ? math.min(lvl, o) : math.max(lvl, o)) : lvl
         else if hitTarget
             res.reason := EXIT_TARGET
             res.fill := target
@@ -1950,13 +1960,25 @@ cooldownBlocked = entryFreshRaw and not cooldownClear
 // ============================================================================
 
 // ----------------------------------------------- Which rules are live ------
-// E1 and E8 belong to both models. E2 and E3 are the fixed-R model; E4 to E7
-// are the structural one. Nominating a model is therefore just a matter of
-// which enable flags reach the shared exit functions.
+// E1, E3 and E8 belong to both models. E2 is the fixed-R model; E4 to E7 are
+// the structural one. Nominating a model is therefore just a matter of which
+// enable flags reach the shared exit functions.
+//
+// E3 IS SHARED DELIBERATELY. Every other structural rule is an exit rule -
+// none of E4 to E7 can hold a position, they can only end one - so a
+// structural model without a trail has no mechanism for riding a trend at
+// all. Its floor stays the fixed E1 stop for the life of the trade, which on
+// a strong trend means it is stopped out early or timed out by E8, and the
+// structural rules never get a chance to speak. Observed on BIMAS: 72% E1,
+// 28% E8, zero structural exits, on a move from 80 to 425 - the structural
+// rules were right to stay silent, and the floor was what closed the trade.
+//
+// On the structural track E3 is the trailing FLOOR: E4 to E7 remain live and
+// close the position first whenever the case for it dissolves.
 liveStructural = exitLiveModelStr == "Structural"
 liveE1 = useE1
 liveE2 = useE2 and not liveStructural
-liveE3 = useE3 and not liveStructural
+liveE3 = useE3
 liveE4 = useE4 and liveStructural
 liveE5 = useE5 and liveStructural
 liveE6 = useE6 and liveStructural
@@ -1984,6 +2006,20 @@ oppSignalNow = entrySignalFresh and finalDir != 0 and posDir != 0 and finalDir !
 // trail on the current bar's own high and then testing that same bar's low
 // against it would be intrabar lookahead: the stop would appear to have been
 // raised before the price that raised it had printed.
+//
+// TRAIL GEOMETRY - read this before choosing exitTrailATR.
+// For a long the trail sits at  entry + tMfe - trailATR * atr,  while the
+// hard stop sits at  entry - stopATR * atr.  So the trail only becomes the
+// binding floor once
+//         tMfe  >  (trailATR - stopATR) * atr
+// and until then the hard stop is what protects the position. Two more
+// landmarks follow from the same line: the trail reaches breakeven at
+// tMfe = trailATR * atr, and locks in X R at tMfe = (trailATR + X) * atr.
+//
+// A trail TIGHTER than the hard stop therefore binds from the first bar and
+// makes E1 dead weight; a trail much wider gives the position room but leaves
+// the initial risk at a full 1R for longer. Neither is wrong - it is the
+// choice between protecting the entry and riding the trend.
 posTrail = posDir == 0 or na(posAtr) or na(posEntry) ? na :
  (posDir > 0 ? posEntry + posMfe - exitTrailATR * posAtr
              : posEntry - posMfe + exitTrailATR * posAtr)
@@ -2142,7 +2178,8 @@ if warmedUp and not na(rawScore) and not na(totalScore)
 // DUAL TRACK (8.5c): every record carries three independent outcomes.
 //   ret    - the control. Fixed horizon, no exit rule applied at all.
 //   fR     - fixed-R:     E1 + E2 + optional E3, backstopped by E8.
-//   sR     - structural:  E1 as a floor, then E4-E7, backstopped by E8.
+//   sR     - structural:  E1 and optional E3 as the floor, then E4-E7,
+//                         backstopped by E8.
 // Both models are simulated on every record regardless of which one is live,
 // so the panel compares them without the user reconfiguring anything. All
 // three are quoted in the same R, defined by the E1 stop distance, so a
@@ -2212,8 +2249,8 @@ if array.size(sigLog) > 0
 
                 // ---- track B: structural --------------------------------
                 if not r.sDone
-                    ExitRes sx = f_modelExit(r.dir, age, rStop, na, na,
-                         useE1, false, false, useE4, useE5, useE6, useE7, useE8,
+                    ExitRes sx = f_modelExit(r.dir, age, rStop, rTrail, na,
+                         useE1, useE3, false, useE4, useE5, useE6, useE7, useE8,
                          rDecay, exitScoreBars, dBias, srcClose, rPac, rOpp,
                          exitMaxBars, exitStopFirst, exitGapFill, open, high, low, close)
                     if sx.reason != EXIT_NONE

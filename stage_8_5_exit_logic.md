@@ -91,7 +91,7 @@ than of exit quality.
 |---|---|---|---|---|
 | E1 | Hard stop | Both | On | `exitStopATR` 1.0 |
 | E2 | Fixed target | Fixed-R | On | `exitTargetATR` 2.0 |
-| E3 | Trailing stop | Fixed-R | Off | `exitTrailATR` 1.5 |
+| E3 | Trailing stop | Both | Off | `exitTrailATR` 1.5 |
 | E4 | Score decay | Structural | On | `exitScoreFloor` 40, `exitScoreBars` 2 |
 | E5 | 1D bias flip | Structural | On | — |
 | E6 | PAC cross against | Structural | On | `exitPacLine` mid |
@@ -105,6 +105,23 @@ Notes on individual rules:
 - **E3** trails the favourable extreme achieved through the **previous** bar.
   Ratcheting on the current bar's own high and then testing that same bar's
   low against it would be intrabar lookahead.
+
+  **Amended after implementation.** E3 was originally scoped to the fixed-R
+  track. That left the structural model with no mechanism for holding a
+  position: E4-E7 are all exit rules, none of them can keep a trade open, so
+  the structural floor stayed at the fixed E1 stop for the life of the trade.
+  On a strong trend that means the position is stopped out early or timed out
+  by E8 and the structural rules never get to speak. Observed on BIMAS: 72%
+  E1, 28% E8, zero structural exits, across a move from 80 to 425 - the
+  structural rules were right to stay silent, and the floor closed the trade.
+  E3 is now available to both tracks under its own toggle. On the structural
+  track it is the trailing floor, with E4-E7 live as early-exit overrides.
+
+  **Trail geometry.** For a long the trail sits at
+  `entry + tMfe - trailATR x atr` against a hard stop at
+  `entry - stopATR x atr`, so the trail only becomes the binding floor once
+  `tMfe > (trailATR - stopATR) x atr`. It reaches breakeven at
+  `tMfe = trailATR x atr` and locks in X R at `tMfe = (trailATR + X) x atr`.
 - **E4** reads the **pre-veto directional** score. The post-veto score is
   zeroed whenever the daily bias goes neutral, so using it would fire E4 on
   every neutral daily bar — duplicating E5, far more often, and for a reason
