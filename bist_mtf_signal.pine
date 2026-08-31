@@ -167,6 +167,7 @@ const string G_L5   = "Layer 5 - 1D Directional Lock (hard veto)"
 const string G_L6   = "Layer 6 - Structural Level Proximity (S/R)"
 const string G_L7   = "Layer 7 - Volatility Regime (ATR)"
 const string G_L8   = "Layer 8 - Market / Index Correlation"
+const string G_L9   = "Layer 9 - Liquidity Sweep"
 const string G_ENT  = "Entry Timing (1h)"
 const string G_EXH  = "Exhaustion Gate (15m)"
 const string G_DISP = "Display"
@@ -319,6 +320,23 @@ idxConfirmedOnly = input.bool(false, "Index TF: use last CLOSED bar only", group
      tooltip = "Only meaningful when the index timeframe above is HIGHER than the chart timeframe. " +
      "At the chart timeframe the index bar closes when the chart bar does, so the offset would " +
      "just add a bar of lag for nothing.")
+
+// ---------------------------------------------------------------- Layer 9 ---
+useL9 = input.bool(true, "Enable Layer 9", group = G_L9)
+wL9   = input.float(5.0, "Weight", minval = 0.0, maxval = 100.0, step = 0.5, group = G_L9)
+sweepMaxAge = input.int(2, "Sweep must have printed within N bars", minval = 0, maxval = 10,
+     group = G_L9,
+     tooltip = "The spec's 1-2 bar window. A sweep is only tradeable while it is fresh: the whole " +
+     "premise is that stops were just taken and the move immediately failed. 0 means the sweep must " +
+     "be on the current bar.")
+sweepMinPierce = input.float(0.05, "Minimum pierce beyond the level (ATR units)", minval = 0.0,
+     step = 0.01, group = G_L9,
+     tooltip = "A wick that merely grazed the level did not take anyone's stops. Requiring a real " +
+     "pierce - measured in ATR so it scales with the ticker - rejects that noise.")
+sweepFloorConf = input.float(0.4, "Confidence at the oldest allowed bar", minval = 0.0, maxval = 1.0,
+     step = 0.05, group = G_L9,
+     tooltip = "Confidence decays linearly from 1.0 on the sweep bar itself to this value at the " +
+     "edge of the window above.")
 
 // ------------------------------------------------- Entry timing (1h) ---
 useEntryTiming = input.bool(true, "Enable 1h entry timing", group = G_ENT,
@@ -768,6 +786,78 @@ f_bist100Score(int dir, float chgPct, float neutralPct) =>
     out
 
 // ============================================================================
+//  LAYER 9 - LIQUIDITY SWEEP                   (design weight 5)
+//  REAL OHLC IS MANDATORY HERE (mixed-candle policy). A sweep is defined by
+//  where the WICK went and where the candle CLOSED; Heikin Ashi bars have
+//  synthetic opens and smoothed extremes, so the pattern simply does not
+//  survive the transformation.
+//
+//  Pattern: price pushes through a known level, takes the stops resting the
+//  other side of it, and closes back inside within a bar or two.
+//    LONG  : low  pierced BELOW a level by >= sweepMinPierce ATR, close came
+//            back ABOVE it.
+//    SHORT : high pierced ABOVE a level, close came back BELOW it.
+//
+//  LEVELS: the confirmed pivot arrays maintained for layer 6 are reused, so
+//  srLeft / srRight / srKeep shape this layer too, and the confirmed-pivot
+//  guarantee carries over - no level in those arrays can shift on the
+//  realtime bar. The arrays are maintained unconditionally, so layer 9 keeps
+//  working with layer 6 switched off. Both arrays are searched in both
+//  directions: the geometry test itself rejects a level on the wrong side,
+//  and a former pivot high that price now trades above is exactly the kind
+//  of level that gets swept.
+//
+//  NO RETROACTIVE LEVELS: the scan looks back up to sweepMaxAge bars using
+//  the level set known AS OF THE CURRENT BAR. That is not lookahead - it
+//  uses only past prices and presently-known levels - and the value printed
+//  for a bar never changes afterwards.
+//
+//  Confidence decays linearly with the age of the sweep. No sweep in the
+//  window -> 0.0 (an absent pattern is a real zero, not an unknown). No
+//  levels or no ATR yet -> neutral 0.5.
+// ============================================================================
+
+// True if the bar `i` bars back swept any level in `a` in direction `dir`.
+// The array.size() guard is required for the same reason as in layer 6:
+// Pine's for-loop counts downward when `to` is below `from`.
+f_barSweeps(int dir, array<float> a, int i, float atrv, float minPierce) =>
+    bool hit = false
+    if array.size(a) > 0
+        float hi = high[i]
+        float lo = low[i]
+        float cl = close[i]
+        if not na(hi) and not na(lo) and not na(cl)
+            for k = 0 to array.size(a) - 1
+                float lvl = array.get(a, k)
+                if not na(lvl)
+                    if dir > 0
+                        if lo < lvl and cl > lvl and (lvl - lo) >= minPierce * atrv
+                            hit := true
+                    else
+                        if hi > lvl and cl < lvl and (hi - lvl) >= minPierce * atrv
+                            hit := true
+    hit
+
+f_liquiditySweepScore(int dir, array<float> hiLvls, array<float> loLvls, simple int maxAge,
+     float atrv, float minPierce, float floorConf) =>
+    float out = 0.0
+    if na(atrv) or atrv <= 0.0 or (array.size(hiLvls) == 0 and array.size(loLvls) == 0)
+        out := 0.5
+    else
+        int foundAt = -1
+        for i = 0 to maxAge
+            if foundAt < 0 and (f_barSweeps(dir, hiLvls, i, atrv, minPierce) or
+             f_barSweeps(dir, loLvls, i, atrv, minPierce))
+                foundAt := i
+        if foundAt < 0
+            out := 0.0
+        else if maxAge <= 0
+            out := 1.0
+        else
+            out := f_clamp(1.0 - (1.0 - floorConf) * foundAt / maxAge, 0.0, 1.0)
+    out
+
+// ============================================================================
 //  SCORE AGGREGATION
 //  Both hypotheses are scored every bar; the stronger one becomes the
 //  candidate direction. Every layer is computed unconditionally (keeps ta.*
@@ -796,8 +886,14 @@ s7Both  = f_volatilityScore(atrVal, atrAvg, atrVal[atrSlopeLb], atrRatioLo, atrC
 s8Long  = f_bist100Score( 1, idxChgRaw, idxNeutralPct)
 s8Short = f_bist100Score(-1, idxChgRaw, idxNeutralPct)
 
+s9Long  = f_liquiditySweepScore( 1, srHighs, srLows, sweepMaxAge, atrVal, sweepMinPierce,
+     sweepFloorConf)
+s9Short = f_liquiditySweepScore(-1, srHighs, srLows, sweepMaxAge, atrVal, sweepMinPierce,
+     sweepFloorConf)
+
 // No c5 parameter: layer 5 is the hard veto and carries no weight.
-f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8) =>
+f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8,
+     float c9) =>
     float num = 0.0
     float den = 0.0
     if useL1
@@ -821,6 +917,9 @@ f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8
     if useL8
         num += c8 * wL8
         den += wL8
+    if useL9
+        num += c9 * wL9
+        den += wL9
     float outv = 0.0
     if normalizeWeights
         outv := den > 0.0 ? num / den * 100.0 : 0.0
@@ -828,8 +927,10 @@ f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8
         outv := num
     f_clamp(outv, 0.0, 100.0)
 
-longScore  = f_aggregate(s1Long,  s2Long,  s3Long,  s4Both, s6Long,  s7Both, s8Long)
-shortScore = f_aggregate(s1Short, s2Short, s3Short, s4Both, s6Short, s7Both, s8Short)
+longScore  = f_aggregate(s1Long,  s2Long,  s3Long,  s4Both, s6Long,  s7Both, s8Long,
+     s9Long)
+shortScore = f_aggregate(s1Short, s2Short, s3Short, s4Both, s6Short, s7Both, s8Short,
+     s9Short)
 
 // Candidate direction: +1 long, -1 short, 0 tie/flat.
 sigDir  = longScore > shortScore ? 1 : (shortScore > longScore ? -1 : 0)
