@@ -167,7 +167,12 @@
 // ============================================================================
 
 //@version=6
-indicator("BIST MTF Signal System", shorttitle = "BIST MTF", overlay = false, precision = 1, max_bars_back = 1000)
+indicator("BIST MTF Signal System", shorttitle = "BIST MTF", overlay = false, precision = 1,
+     max_bars_back = 1000, max_labels_count = 500)
+// max_labels_count = 500: one label per exit accumulates across the chart,
+// plus the single live score label. Pine drops the oldest beyond the cap, so
+// on a long history the earliest exits lose their labels while their markers
+// and the panel record remain.
 // max_bars_back = 1000 covers the deepest Stage 1 lookback (slow EMA, default
 // 200, user-raisable toward the 600 discussed in the spec) plus PAC/pivot
 // warm-up headroom added in later stages.
@@ -634,6 +639,15 @@ panelDetailRows = input.int(10, "Panel: detail rows", minval = 1, maxval = 20, g
 showEntrySignals = input.bool(true, "Show entry signals", group = G_DISP,
      tooltip = "Entry markers on the price chart, the colour-coded score line and the score label. " +
      "Turn OFF for a bare score pane.")
+showExitMarkers = input.bool(true, "Show exit markers", group = G_DISP,
+     tooltip = "A cross on the exit bar, opposite the entry triangle, coloured by outcome rather " +
+     "than by direction: teal for a non-negative R, maroon for a loss.")
+showExitLabels = input.bool(true, "Show exit labels", group = G_DISP,
+     tooltip = "Reason and R on each exit, so a losing exit says immediately whether it was " +
+     "stopped, decayed or timed out.")
+showRiskLevels = input.bool(true, "Show stop / target levels", group = G_DISP,
+     tooltip = "Traces the live stop and target for as long as each position is open. Drawn with " +
+     "a break-on-gap style, so separate positions never appear joined.")
 showDebugLayers = input.bool(false, "Show debug layers", group = G_DISP,
      tooltip = "MASTER SWITCH for every diagnostic trace below. With it off, none of them draw no " +
      "matter how their individual switches are set - so you can leave those configured and flip " +
@@ -1974,9 +1988,11 @@ int   exitReason   = EXIT_NONE
 float exitFill     = na
 float exitR        = na
 bool  exitFired    = false
-int   exitDirWas   = 0
-float exitEntryWas = na
-int   exitBarsHeld = 0
+int   exitDirWas    = 0
+float exitEntryWas  = na
+int   exitBarsHeld  = 0
+float exitStopWas   = na
+float exitTargetWas = na
 
 // Toggling exits off mid-chart must not strand an open position forever.
 if not useExits and posDir != 0
@@ -1997,9 +2013,13 @@ if useExits and posDir != 0
             exitReason   := liveRes.reason
             exitFill     := liveRes.fill
             exitFired    := true
-            exitDirWas   := posDir
-            exitEntryWas := posEntry
-            exitBarsHeld := age
+            exitDirWas    := posDir
+            exitEntryWas  := posEntry
+            exitBarsHeld  := age
+            // Kept so the exit bar can still draw the levels that were live
+            // during it - the position itself is cleared a few lines below.
+            exitStopWas   := posStop
+            exitTargetWas := posTarget
             // R is quoted against the E1 stop distance whatever closed the
             // trade, so every exit rule is measured in the same currency.
             float oneR = na(posAtr) or posAtr <= 0.0 ? na : exitStopATR * posAtr
@@ -2030,6 +2050,11 @@ if useExits and entryAccepted and finalDir != 0
      (finalDir > 0 ? close - exitStopATR * atrVal : close + exitStopATR * atrVal)
     posTarget := na(atrVal) ? na :
      (finalDir > 0 ? close + exitTargetATR * atrVal : close - exitTargetATR * atrVal)
+
+// Unrealised R on the open position, in the same currency as every closed
+// outcome. na when flat or before the ATR has warmed up.
+openR = posDir == 0 or na(posAtr) or posAtr <= 0.0 or na(posEntry) ? na :
+ (close - posEntry) * posDir / (exitStopATR * posAtr)
 
 // ------------------------------------------------------- Cooldown anchor ---
 // D7: anchored at the EXIT once exits exist. While a position is open the
@@ -2234,6 +2259,44 @@ plotchar(showEntrySignals and entryAccepted and earningsRisk, "Entry in earnings
      "!", location.top, color = color.new(color.orange, 0), size = size.tiny,
      force_overlay = true)
 
+// -------------------------------------------------- Exit markers on price ---
+// Direction is already carried by which side of the bar the cross sits on, so
+// colour is free to carry the thing the entry marker cannot: whether the
+// trade worked. Teal for a non-negative R, maroon for a loss, gray when the
+// ATR was unavailable at entry and R could not be computed.
+exitOutcomeCol = na(exitR) ? color.new(color.gray, 0) :
+ (exitR >= 0.0 ? color.new(color.teal, 0) : color.new(color.maroon, 0))
+
+plotshape(showEntrySignals and showExitMarkers and exitFired and exitDirWas > 0, "Long Exit",
+     shape.xcross, location.abovebar, color = exitOutcomeCol, size = size.tiny,
+     force_overlay = true)
+plotshape(showEntrySignals and showExitMarkers and exitFired and exitDirWas < 0, "Short Exit",
+     shape.xcross, location.belowbar, color = exitOutcomeCol, size = size.tiny,
+     force_overlay = true)
+
+if showEntrySignals and showExitLabels and exitFired
+    label.new(bar_index, exitDirWas > 0 ? high : low,
+         f_exitName(exitReason) + "  " + (na(exitR) ? "-" : f_signed(exitR, "#.0") + "R"),
+         style = exitDirWas > 0 ? label.style_label_down : label.style_label_up,
+         color = exitOutcomeCol, textcolor = color.white, size = size.tiny,
+         force_overlay = true)
+
+// ------------------------------------------------- Stop and target levels ---
+// plot() with a break style rather than line objects: the levels then need no
+// per-position drawing budget, every historical position keeps its levels, and
+// a flat stretch between positions breaks the line instead of joining two
+// unrelated trades. The exit bar falls back to the levels captured above, so
+// the bar that resolved the trade still shows what it was resolved against.
+riskStopPx   = posDir != 0 ? posStop   : (exitFired ? exitStopWas   : na)
+riskTargetPx = posDir != 0 ? posTarget : (exitFired ? exitTargetWas : na)
+
+plot(showEntrySignals and showRiskLevels ? riskStopPx : na, "Stop level",
+     color = color.new(color.maroon, 25), style = plot.style_linebr, linewidth = 1,
+     force_overlay = true)
+plot(showEntrySignals and showRiskLevels ? riskTargetPx : na, "Target level",
+     color = color.new(color.teal, 25), style = plot.style_linebr, linewidth = 1,
+     force_overlay = true)
+
 // ------------------------------------------------------------- Score label ---
 // Rebuilt on the LAST BAR ONLY. One label per historical bar would be
 // unreadable and would burn through Pine's drawing-object budget in a few
@@ -2264,7 +2327,8 @@ if barstate.islast
              (na(exitR) ? "" : "  " + f_signed(exitR, "#.00") + "R")
         else if posDir != 0
             stateTxt := "in " + (posDir > 0 ? "LONG" : "SHORT") + ", " +
-             str.tostring(bar_index - posBar) + " bars held"
+             str.tostring(bar_index - posBar) + " bars, " +
+             (na(openR) ? "-" : f_signed(openR, "#.00") + "R")
         else if entrySignalFresh
             stateTxt := "signal suppressed - position already open"
         else if cooldownBlocked
