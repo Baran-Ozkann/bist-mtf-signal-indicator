@@ -15,8 +15,14 @@
 //  [x] Stage 7  Visuals (plotshape, colour coding, score label)
 //  [x] Stage 8  Performance log panel
 //  [x] Stage 8.5 Exit logic (positions, exit rules, comparison)
-//  [x] Stage 9  Unified alertcondition()  <-- CURRENT
-//  [ ] Stage 10 End-to-end / repaint testing
+//  [x] Stage 9  Unified alertcondition()
+//  [~] Stage 10 End-to-end / repaint testing            <-- CURRENT
+//        [x] Static audit - no defects found, recorded in the findings doc
+//        [x] Layer ablation harness (14 parallel streams, one pass)
+//        [x] Buy-and-hold benchmark row
+//        [x] README + calibration findings
+//        [ ] Bar-replay repaint runs        - protocol written, awaiting runs
+//        [ ] Ablation cross-check vs manual - protocol written, awaiting runs
 //
 // ============================================================================
 //  request.security() CALL INVENTORY  (Stage 5)
