@@ -11,8 +11,8 @@
 //  [x] Stage 3  1h entry timing + 15m exhaustion gate
 //  [x] Stage 4  Mid-tier layers 6-8
 //  [x] Stage 5  Advanced layers 9-13
-//  [x] Stage 6  Cooldown + earnings blacklist                <-- CURRENT
-//  [ ] Stage 7  Visuals (plotshape, colour coding, score label)
+//  [x] Stage 6  Cooldown + earnings blacklist
+//  [x] Stage 7  Visuals (plotshape, colour coding, score label)  <-- CURRENT
 //  [ ] Stage 8  Performance log panel
 //  [ ] Stage 9  Unified alertcondition()
 //  [ ] Stage 10 End-to-end / repaint testing
@@ -546,6 +546,15 @@ showRisk       = input.bool(true, "Debug: earnings / KAP risk shading", group = 
 showGates      = input.bool(false, "Debug: entry / exhaustion gate states", group = G_DISP,
      tooltip = "Stepped traces: score armed (30), entry ready (60), entry signal (90), cooldown " +
      "blocked (100). The stack shows exactly which gate a setup died at.")
+showPivots     = input.bool(false, "Debug: pivot fractals and active S/R (price chart)",
+     group = G_DISP,
+     tooltip = "Marks every confirmed pivot at the bar it actually printed on, and traces the two " +
+     "levels layers 6 and 9 are currently measuring against. This is the view for checking that " +
+     "the structure the score reacts to is the structure you would have drawn by hand.")
+showLayers     = input.bool(false, "Debug: individual layer confidences", group = G_DISP,
+     tooltip = "Each layer's own 0.0-1.0 confidence, scaled to the pane's 0-100 axis, for the " +
+     "CANDIDATE direction (pre-veto, so the traces stay readable while the score is zeroed). " +
+     "Twelve overlapping lines is a lot: hide the ones you are not chasing in the Style tab.")
 
 // ============================================================================
 //  HELPERS
@@ -1613,6 +1622,8 @@ dbgRawScore   = showDebugLayers and showRawScore
 dbgBias       = showDebugLayers and showBias
 dbgRisk       = showDebugLayers and showRisk
 dbgGates      = showDebugLayers and showGates
+dbgPivots     = showDebugLayers and showPivots
+dbgLayers     = showDebugLayers and showLayers
 
 f_dirColor(int dir) =>
     dir > 0 ? color.teal : (dir < 0 ? color.maroon : color.gray)
@@ -1729,6 +1740,60 @@ plot(dbgGates and cooldownBlocked ? 100 : na, "Debug: Cooldown Blocked",
 // does not touch the score and cannot suppress a signal.
 bgcolor(dbgRisk and earningsRisk ? color.new(color.yellow, 90) : na,
      title = "Debug: Earnings risk window")
+
+// ----------------------------------------- Debug: structure on the price ---
+// The pivot markers are shifted back by srRight bars so each one sits on the
+// bar that actually formed the pivot, not on the later bar where it
+// confirmed. Seeing them in their true position is the point: the gap
+// between the marker and the right-hand edge IS the confirmation lag that
+// keeps these levels repaint-safe.
+plotshape(dbgPivots ? pivotHi : na, "Debug: Pivot High", shape.xcross, location.absolute,
+     color = color.new(color.maroon, 30), size = size.tiny, offset = -srRight,
+     force_overlay = true)
+plotshape(dbgPivots ? pivotLo : na, "Debug: Pivot Low", shape.xcross, location.absolute,
+     color = color.new(color.teal, 30), size = size.tiny, offset = -srRight,
+     force_overlay = true)
+
+// The two levels layer 6 grades distance against and layer 9 watches for
+// sweeps. Circles rather than a line: these jump discontinuously as price
+// crosses a level, and a joined line would imply movement that is not there.
+plot(dbgPivots ? srSupport : na, "Debug: Nearest support", color = color.new(color.teal, 40),
+     style = plot.style_circles, linewidth = 1, force_overlay = true)
+plot(dbgPivots ? srResist : na, "Debug: Nearest resistance", color = color.new(color.maroon, 40),
+     style = plot.style_circles, linewidth = 1, force_overlay = true)
+
+// ------------------------------------- Debug: individual layer confidences ---
+// Scaled to the pane's 0-100 axis. Read against the CANDIDATE direction
+// (sigDir, pre-veto) rather than finalDir, so the traces keep saying
+// something while the veto holds the score at zero - which is exactly when
+// you want to know what the layers thought.
+f_layerTrace(int dir, float longV, float shortV) =>
+    (dir < 0 ? shortV : longV) * 100.0
+
+plot(dbgLayers ? f_layerTrace(sigDir, s1Long, s1Short) : na, "Debug: L1 Regime",
+     color = color.new(color.red, 30))
+plot(dbgLayers ? f_layerTrace(sigDir, s2Long, s2Short) : na, "Debug: L2 PAC",
+     color = color.new(color.orange, 30))
+plot(dbgLayers ? f_layerTrace(sigDir, s3Long, s3Short) : na, "Debug: L3 Momentum",
+     color = color.new(color.yellow, 30))
+plot(dbgLayers ? s4Both * 100.0 : na, "Debug: L4 Volume",
+     color = color.new(color.lime, 30))
+plot(dbgLayers ? f_layerTrace(sigDir, s6Long, s6Short) : na, "Debug: L6 S/R proximity",
+     color = color.new(color.green, 30))
+plot(dbgLayers ? s7Both * 100.0 : na, "Debug: L7 Volatility",
+     color = color.new(color.aqua, 30))
+plot(dbgLayers ? f_layerTrace(sigDir, s8Long, s8Short) : na, "Debug: L8 Index",
+     color = color.new(color.blue, 30))
+plot(dbgLayers ? f_layerTrace(sigDir, s9Long, s9Short) : na, "Debug: L9 Sweep",
+     color = color.new(color.navy, 30))
+plot(dbgLayers ? f_layerTrace(sigDir, s10Long, s10Short) : na, "Debug: L10 Divergence",
+     color = color.new(color.purple, 30))
+plot(dbgLayers ? f_layerTrace(sigDir, s11Long, s11Short) : na, "Debug: L11 Candle",
+     color = color.new(color.fuchsia, 30))
+plot(dbgLayers ? f_layerTrace(sigDir, s12Long, s12Short) : na, "Debug: L12 USDTRY",
+     color = color.new(color.olive, 30))
+plot(dbgLayers ? s13Both * 100.0 : na, "Debug: L13 Session",
+     color = color.new(color.silver, 30))
 
 hline(scoreThreshold, "Threshold", color = color.new(color.gray, 40), linestyle = hline.style_dashed)
 hline(80, "Band 80", color = color.new(color.gray, 80), linestyle = hline.style_dotted)
