@@ -669,6 +669,18 @@ panelShowBands = input.bool(true, "Panel: win rate and excursions by band", grou
 panelShowModels = input.bool(true, "Panel: exit model comparison", group = G_LOG,
      tooltip = "Fixed-R against structural against the exit-free control, all on the same signals " +
      "and all quoted in the same R.")
+panelShowBench = input.bool(true, "Panel: buy-and-hold benchmark", group = G_LOG,
+     tooltip = "THE REFERENCE POINT. An average R means nothing on its own - the question is " +
+     "whether all this machinery beat simply buying the stock and doing nothing.\n\n" +
+     "WINDOW: from the oldest signal still in the log to the current bar. That is the span the " +
+     "system's own numbers come from, so the two are measured over the same ground.\n\n" +
+     "SUM, NOT AVERAGE. The system takes many trades and holding takes one, so the honest " +
+     "comparison is total R against total R. sys R assumes the same risk on every trade, which is " +
+     "the standard fixed-fraction assumption and is not the same thing as an account curve.\n\n" +
+     "READ IT WITH THESE IN MIND: gross R, no commission, slippage or compounding; the benchmark " +
+     "is long-only while the system can also go short; the hold's risk unit is the ATR at the " +
+     "start of the window; and unresolved trades are excluded, which understates the system " +
+     "slightly. A positive edge over one symbol and one window is a data point, not a result.")
 panelShowReasons = input.bool(true, "Panel: exit reason breakdown", group = G_LOG,
      tooltip = "Which rule is actually doing the work in the LIVE model. A structural model where " +
      "most exits come from the time stop is not a structural model.")
@@ -2965,6 +2977,7 @@ if barstate.islast
         nRows := nRows + (panelShowReach ? 8 : 0)
         nRows := nRows + (panelShowBands ? 6 : 0)
         nRows := nRows + (panelShowModels ? 4 : 0)
+        nRows := nRows + (panelShowBench ? 2 : 0)
         nRows := nRows + (panelShowReasons ? 9 : 0)
         nRows := nRows + (panelShowAblation ? 15 : 0)
         nRows := nRows + (panelShowDetail ? 1 + math.max(detailN, 1) : 0)
@@ -3185,6 +3198,73 @@ if barstate.islast
                      str.tostring(array.get(pmBars, t) / (n * 1.0), "#.0") : "-",
                      cText, pSize, text.align_right)
                 row := row + 1
+
+        // -------------------------------------------------------- BENCHMARK ---
+        // Did any of this beat holding the stock? Measured over the log's own
+        // span - from the oldest surviving record to now - so the system and
+        // the hold are judged on the same ground.
+        //
+        // TOTAL against TOTAL. The system takes many trades and the hold takes
+        // one, so comparing an average-per-trade against a single hold would
+        // flatter whichever side happened to trade less. sys R is therefore the
+        // SUM of the live model's resolved outcomes.
+        //
+        // Computed from its own pass over the log rather than by reading the
+        // exit-model accumulators, so this section does not silently depend on
+        // BY EXIT MODEL being switched on.
+        if panelShowBench
+            f_pcell(perfTable, 0, row, "BENCHMARK", cHead, pSize, text.align_left)
+            f_pcell(perfTable, 1, row, "bars",  cHead, pSize, text.align_right)
+            f_pcell(perfTable, 2, row, "B&H %", cHead, pSize, text.align_right)
+            f_pcell(perfTable, 3, row, "B&H R", cHead, pSize, text.align_right)
+            f_pcell(perfTable, 4, row, "sys R", cHead, pSize, text.align_right)
+            f_pcell(perfTable, 5, row, "edge",  cHead, pSize, text.align_right)
+            f_pcell(perfTable, 6, row, "n",     cHead, pSize, text.align_right)
+            row := row + 1
+
+            float sysR = 0.0
+            int   sysN = 0
+            if logN > 0
+                for i = 0 to logN - 1
+                    SigRec r = array.get(sigLog, i)
+                    bool  done = liveStructural ? r.sDone : r.fDone
+                    float rr   = liveStructural ? r.sR    : r.fR
+                    if done and not na(rr)
+                        sysR := sysR + rr
+                        sysN := sysN + 1
+
+            // The oldest surviving record defines the window: buy at its entry
+            // price, hold to the current bar, long-only.
+            //
+            // Every field read happens INSIDE the guard. Pine does not promise
+            // to short-circuit `and`, so testing logN and dereferencing the
+            // record in one expression could still touch an na object.
+            float bhPct  = na
+            float bhR    = na
+            int   bhBars = na
+            string bhFrom = "hold"
+            if logN > 0
+                SigRec first = array.get(sigLog, 0)
+                bhBars := bar_index - first.barIdx
+                bhFrom := "from " + str.format_time(first.tm, "dd MMM yy", syminfo.timezone)
+                if not na(first.entry) and first.entry > 0.0
+                    bhPct := (close - first.entry) / first.entry * 100.0
+                    bhR   := f_retToR(bhPct, first.entry, first.atrAt, exitStopATR)
+            float edge = na(bhR) ? na : sysR - bhR
+
+            f_pcell(perfTable, 0, row, bhFrom, cText, pSize, text.align_left)
+            f_pcell(perfTable, 1, row, na(bhBars) ? "-" : str.tostring(bhBars),
+                 cText, pSize, text.align_right)
+            f_pcell(perfTable, 2, row, na(bhPct) ? "-" : f_signed(bhPct, "#.0") + "%",
+                 cText, pSize, text.align_right)
+            f_pcell(perfTable, 3, row, f_signed(bhR, "#.00"), cText, pSize, text.align_right)
+            f_pcell(perfTable, 4, row, sysN > 0 ? f_signed(sysR, "#.00") : "-",
+                 cText, pSize, text.align_right)
+            f_pcell(perfTable, 5, row, sysN > 0 ? f_signed(edge, "#.00") : "-",
+                 na(edge) or sysN <= 0 ? cText : (edge > 0.0 ? cWin : cLoss), pSize,
+                 text.align_right)
+            f_pcell(perfTable, 6, row, str.tostring(sysN), cText, pSize, text.align_right)
+            row := row + 1
 
         // ------------------------------------------------ BY EXIT REASON ---
         if panelShowReasons
