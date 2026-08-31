@@ -578,22 +578,24 @@ exitGapFill = input.bool(true, "Gap through the stop fills at the bar open", gro
      "fill is the worse of the two, which is what actually happens on a gap. Applied to the STOP " +
      "only: crediting the same price improvement on a target would flatter the result.")
 
-useE3 = input.bool(true, "E3 - trailing stop", group = G_EXIT,
-     tooltip = "Available to BOTH models - it is the only rule that lets a position be HELD rather " +
-     "than closed, so binding it to one track left the structural model with nothing but exit " +
-     "rules and no way to ride a trend.\n\n" +
-     "On the structural track it is the trailing FLOOR: E4-E7 stay live as early-exit overrides " +
-     "and close the position first whenever the case for it dissolves.\n\n" +
-     "NOTE that this is shared, so switching it on also changes the fixed-R model from a two-rule " +
-     "stop-and-target into a three-rule one. Any fixed-R numbers recorded before it was enabled " +
-     "are not comparable with the ones recorded after.")
+useE3 = input.bool(false, "E3 - trailing stop", group = G_EXIT,
+     tooltip = "OFF - MEASURED, NOT ASSUMED. Tested across six tickers at 3.0 and 5.0 ATR and it " +
+     "reduced average R on four of the five that had comparable readings. It exits on ordinary " +
+     "pullbacks and gives up more than it protects. See the E3 section of " +
+     "stage_8_5_exit_logic.md before turning it back on - the reasoning that it is the only rule " +
+     "able to HOLD a position is sound and still wrong in practice.\n\n" +
+     "Available to both models when enabled. On the structural track it is the trailing FLOOR, " +
+     "with E4-E7 live as early-exit overrides. Note it is shared, so enabling it also turns the " +
+     "fixed-R model from a two-rule stop-and-target into a three-rule one, and fixed-R numbers " +
+     "recorded either side of that change are not comparable.")
 exitTrailATR = input.float(3.0, "E3 trail distance (ATR)", minval = 0.1, step = 0.1,
      group = G_EXIT,
      tooltip = "Distance held below the best price reached so far. Ratchets on CLOSED bars only.\n\n" +
+     "Only has effect when E3 is enabled, which by default it is not - see that toggle.\n\n" +
      "3.0 against a 1.0 hard stop means the trail takes over once the trade has run 2 ATR in " +
-     "favour, reaches breakeven at 3 ATR and locks 1R at 4 ATR. A tighter trail exits on ordinary " +
-     "consolidation - pullbacks inside a trend routinely run 1 to 2 ATR - which is how a trailing " +
-     "stop ends up cutting exactly the trends it exists to ride.\n\n" +
+     "favour, reaches breakeven at 3 ATR and locks 1R at 4 ATR. Widening it was the obvious answer " +
+     "to a trail that cuts trends early, and 5.0 measured no better than 3.0 - the problem is not " +
+     "the width.\n\n" +
      "The full geometry is in the position management block. Do NOT set this from the panel's " +
      "suggested-target figure: that is computed from the horizon-bounded excursion and understates " +
      "what a trend offers.")
@@ -1990,6 +1992,13 @@ cooldownBlocked = entryFreshRaw and not cooldownClear
 //
 // On the structural track E3 is the trailing FLOOR: E4 to E7 remain live and
 // close the position first whenever the case for it dissolves.
+//
+// E3 SHIPS DISABLED ANYWAY. The argument above is sound and it still lost
+// money: measured across six tickers at 3.0 and 5.0 ATR, enabling the trail
+// reduced average R on four of the five with comparable readings. It exits on
+// ordinary pullbacks and gives up more than it protects. The plumbing stays
+// because the reasoning is worth being able to re-test, not because the rule
+// earned its place. See stage_8_5_exit_logic.md before re-enabling it.
 liveStructural = exitLiveModelStr == "Structural"
 liveE1 = useE1
 liveE2 = useE2 and not liveStructural

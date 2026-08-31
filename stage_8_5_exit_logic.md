@@ -91,7 +91,7 @@ than of exit quality.
 |---|---|---|---|---|
 | E1 | Hard stop | Both | On | `exitStopATR` 1.0 |
 | E2 | Fixed target | Fixed-R | On | `exitTargetATR` 2.0 |
-| E3 | Trailing stop | Both | On | `exitTrailATR` 3.0 |
+| E3 | Trailing stop | Both | **Off** | `exitTrailATR` 3.0 |
 | E4 | Score decay | Structural | On | `exitScoreFloor` 40, `exitScoreBars` 2 |
 | E5 | 1D bias flip | Structural | On | — |
 | E6 | PAC cross against | Structural | On | `exitPacLine` mid |
@@ -122,6 +122,8 @@ Notes on individual rules:
   `entry - stopATR x atr`, so the trail only becomes the binding floor once
   `tMfe > (trailATR - stopATR) x atr`. It reaches breakeven at
   `tMfe = trailATR x atr` and locks in X R at `tMfe = (trailATR + X) x atr`.
+
+  **Tested and rejected — see §13. E3 ships disabled.**
 - **E4** reads the **pre-veto directional** score. The post-veto score is
   zeroed whenever the daily bias goes neutral, so using it would fire E4 on
   every neutral daily bar — duplicating E5, far more often, and for a reason
@@ -303,7 +305,60 @@ excursion window described in §6.
 
 ---
 
-## 12. Decisions
+## 12. The trailing stop was tested and rejected
+
+Recorded here because E3 is the kind of rule that sounds obviously right and
+will be proposed again. It is not enabled by default, and the reasoning below
+is why.
+
+### The argument for it
+
+Every other structural rule is an exit rule. None of E4–E7 can keep a trade
+open — they can only end one — so a structural model without a trail has no
+mechanism for riding a trend, and its floor stays the fixed E1 stop for the
+life of the trade. That argument is sound, and it is what motivated making E3
+available to both tracks.
+
+### What was measured
+
+Average R per signal, structural model, six tickers:
+
+| Ticker | E3 off, stop 1.0 | E3 on, stop 2.0 |
+|---|---|---|
+| TAVHL | +1.18 | — |
+| BIMAS | +0.56 | +0.21 |
+| TOASO | +1.48 | +0.36 |
+| ULKER | +0.63 | +0.73 |
+| TUPRS | +0.15 | +0.14 |
+| GARAN | +0.47 | +0.20 |
+
+Of the five with comparable readings, three are clearly worse, one is a wash
+and one (ULKER) is marginally better. Across those five the summed average R
+falls from +3.29 to +1.64. Widening the trail from 3.0 to 5.0 ATR did not
+help, so the problem is not the width: the trail exits on ordinary pullbacks
+and gives up more than it protects.
+
+### The caveat, which matters if this is ever re-tested
+
+**The two runs differed in two variables, not one.** The E3-on column also
+used a 2.0 ATR hard stop rather than 1.0. Since `1R = exitStopATR x atrAt`,
+doubling the stop doubles the R denominator and mechanically halves every
+R-multiple for identical price behaviour. Several of the observed drops are
+close to exactly half, which is what that confound would produce on its own.
+
+The revert is right regardless — E3 off with a 1.0 stop is the best
+configuration measured — but the *attribution* to the trail is not clean.
+
+**A clean retest** would hold `exitStopATR` fixed at 1.0 and vary only
+`useE3`. The confirming check on the existing runs is the `HORIZON` row of
+the panel's exit-model comparison: it applies no exit rule at all, so it
+cannot be affected by the trail. If it also roughly halved between the two
+runs, the denominator explains most of the movement and E3's real cost is
+smaller than the table above suggests.
+
+---
+
+## 13. Decisions
 
 | # | Question | Resolution |
 |---|---|---|
@@ -316,6 +371,9 @@ excursion window described in §6.
 | D7 | Cooldown anchored at entry or exit? | Exit |
 | D8 | Separate exit alert in Stage 9? | Yes |
 | D9 | Observed MFE/MAE for E1/E2 defaults? | **Deferred** |
+
+**D3 note.** E3 was later made available to both tracks (§4), then disabled
+by default on the evidence in §12.
 
 **D6 was revised after testing.** The live model default is now Structural.
 Fixed-R was chosen as the simpler baseline to judge against; once E3 became
