@@ -672,6 +672,21 @@ panelShowModels = input.bool(true, "Panel: exit model comparison", group = G_LOG
 panelShowReasons = input.bool(true, "Panel: exit reason breakdown", group = G_LOG,
      tooltip = "Which rule is actually doing the work in the LIVE model. A structural model where " +
      "most exits come from the time stop is not a structural model.")
+panelShowAblation = input.bool(false, "Panel: layer ablation", group = G_LOG,
+     tooltip = "WHICH LAYERS EARN THEIR WEIGHT. Fourteen streams run in parallel on this one " +
+     "chart: BASE, plus the same system with each layer removed in turn. No setting changes and " +
+     "no reloading - read the dR column and a layer with a persistently negative dR is costing " +
+     "you score.\n\n" +
+     "OFF by default because it is fifteen rows of panel you only need while calibrating.\n\n" +
+     "MEASURED ON THE HORIZON, so it grades ENTRY QUALITY alone and no exit rule can flatter or " +
+     "spoil it. Every row is renormalised over its own enabled weights, which is what stops the " +
+     "test from measuring threshold sensitivity instead of layer contribution.\n\n" +
+     "BASE WILL NOT MATCH THE HORIZON ROW of the exit-model section, and is not meant to: these " +
+     "streams count every accepted gate crossing, while the log drops signals that arrive while a " +
+     "position is open. Compare rows here WITH EACH OTHER, not against the sections above.\n\n" +
+     "READ n FIRST. A dR of 0.2 across 30 signals on one symbol is noise. Check the sign holds " +
+     "on several tickers before acting on it - the trailing-stop finding was symbol-dependent, " +
+     "and two names could not settle it.")
 panelShowDetail = input.bool(true, "Panel: last signals detail", group = G_LOG)
 panelDetailRows = input.int(10, "Panel: detail rows", minval = 1, maxval = 50, group = G_LOG,
      tooltip = "DISPLAY ONLY - how many individual signals the LAST SIGNALS section prints. It has " +
@@ -773,6 +788,15 @@ f_signed(float v, string fmt) =>
 // Clamp v into [lo, hi]. na in -> na out (callers guard before calling).
 f_clamp(float v, float lo, float hi) =>
     math.max(lo, math.min(hi, v))
+
+// A percentage return expressed in R. ret% of the entry price IS the price
+// move, so this is exact rather than an approximation. Declared up here with
+// the other shared helpers because two callers now need it: the panel's
+// exit-model comparison, which converts the horizon control track, and the
+// Stage 10 ablation harness, which quotes its streams in the same currency.
+f_retToR(float retPct, float entry, float atrAt, float stopMult) =>
+    na(retPct) or na(entry) or na(atrAt) or atrAt <= 0.0 or stopMult <= 0.0 ? na :
+     retPct / 100.0 * entry / (stopMult * atrAt)
 
 // ----------------------------------------------------- Candle primitives ---
 // These take explicit OHLC arguments rather than reading the globals, so the
@@ -906,6 +930,15 @@ var array<int> cdLastSignalBar = array.new_int(2, na)
 // Rolling window of the most recent accepted signals, oldest dropped first.
 var array<SigRec> sigLog = array.new<SigRec>()
 
+// ------------------------------------- Layer ablation counters (Stage 10) ---
+// Fourteen parallel streams: index 0 is the unablated BASE, 1-13 are the same
+// stream with one layer removed. COUNTERS ONLY - the harness keeps no records
+// at all, because it settles each outcome in a single step H bars later rather
+// than tracking it. See the ablation block after the signal assembly.
+var array<int>   abN   = array.new_int(14, 0)
+var array<int>   abWin = array.new_int(14, 0)
+var array<float> abR   = array.new_float(14, 0.0)
+
 // -------------------------------------------- Position state (Stage 8.5) ---
 // The script was stateless about positions until this stage: it logged
 // signals and had no concept of being in one. Exits require that concept.
@@ -970,6 +1003,14 @@ if syminfo.ticker != srTicker
     reachBars := 0
     peakRaw   := na
     peakFinal := na
+    // The ablation counters reset here too. The per-stream cooldown anchors
+    // live inside f_ablSignal as function-local state and cannot be reached
+    // from out here - which costs nothing in practice for the reason the
+    // comment above gives: TradingView recalculates the whole script on a
+    // symbol change, so those anchors are reinitialised with everything else.
+    array.fill(abN,   0)
+    array.fill(abWin, 0)
+    array.fill(abR,   0.0)
     divPxHi1  := na
     divPxHi2  := na
     divRsiHi1 := na
@@ -1554,58 +1595,64 @@ s12Short = f_usdtryScore(-1, fxChgRaw, fxNeutralPct, fxSign)
 
 s13Both  = f_sessionFilterScore(sessFlagged, sessPenalty)
 
+// The sum of the ENABLED layer weights. Depends only on the toggles and the
+// weight inputs - never on the confidences - so it is computed on its own
+// rather than falling out of the aggregation once per direction. One
+// definition, three readers: both score hypotheses and the Stage 10 ablation
+// harness, which cannot renormalise correctly without it.
+// No layer 5 term: it is the hard veto and carries no weight.
+f_enabledWeight() =>
+    (useL1  ? wL1  : 0.0) + (useL2  ? wL2  : 0.0) + (useL3  ? wL3  : 0.0) +
+     (useL4  ? wL4  : 0.0) + (useL6  ? wL6  : 0.0) + (useL7  ? wL7  : 0.0) +
+     (useL8  ? wL8  : 0.0) + (useL9  ? wL9  : 0.0) + (useL10 ? wL10 : 0.0) +
+     (useL11 ? wL11 : 0.0) + (useL12 ? wL12 : 0.0) + (useL13 ? wL13 : 0.0)
+
+// Returns BOTH the finished score and the raw weighted numerator behind it.
+// The numerator is what makes the ablation harness cheap: because the score is
+// a weighted sum, removing layer k is (num - ck*wk) / (den - wk) in closed
+// form, so no layer ever has to be recomputed to ask what the score would have
+// been without it.
 // No c5 parameter: layer 5 is the hard veto and carries no weight.
-f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8,
+f_aggregate(float den, float c1, float c2, float c3, float c4, float c6, float c7, float c8,
      float c9, float c10, float c11, float c12, float c13) =>
     float num = 0.0
-    float den = 0.0
     if useL1
         num += c1 * wL1
-        den += wL1
     if useL2
         num += c2 * wL2
-        den += wL2
     if useL3
         num += c3 * wL3
-        den += wL3
     if useL4
         num += c4 * wL4
-        den += wL4
     if useL6
         num += c6 * wL6
-        den += wL6
     if useL7
         num += c7 * wL7
-        den += wL7
     if useL8
         num += c8 * wL8
-        den += wL8
     if useL9
         num += c9 * wL9
-        den += wL9
     if useL10
         num += c10 * wL10
-        den += wL10
     if useL11
         num += c11 * wL11
-        den += wL11
     if useL12
         num += c12 * wL12
-        den += wL12
     if useL13
         num += c13 * wL13
-        den += wL13
     float outv = 0.0
     if normalizeWeights
         outv := den > 0.0 ? num / den * 100.0 : 0.0
     else
         outv := num
-    f_clamp(outv, 0.0, 100.0)
+    [f_clamp(outv, 0.0, 100.0), num]
 
-longScore  = f_aggregate(s1Long,  s2Long,  s3Long,  s4Both, s6Long,  s7Both, s8Long,
-     s9Long,  s10Long,  s11Long,  s12Long,  s13Both)
-shortScore = f_aggregate(s1Short, s2Short, s3Short, s4Both, s6Short, s7Both, s8Short,
-     s9Short, s10Short, s11Short, s12Short, s13Both)
+aggDen = f_enabledWeight()
+
+[longScore,  aggNumL] = f_aggregate(aggDen, s1Long,  s2Long,  s3Long,  s4Both, s6Long,
+     s7Both, s8Long,  s9Long,  s10Long,  s11Long,  s12Long,  s13Both)
+[shortScore, aggNumS] = f_aggregate(aggDen, s1Short, s2Short, s3Short, s4Both, s6Short,
+     s7Both, s8Short, s9Short, s10Short, s11Short, s12Short, s13Both)
 
 // Candidate direction: +1 long, -1 short, 0 tie/flat.
 sigDir  = longScore > shortScore ? 1 : (shortScore > longScore ? -1 : 0)
@@ -1975,6 +2022,217 @@ entrySignalFresh = entryFreshRaw and cooldownClear
 
 // Diagnostic: a setup that completed but was refused by the cooldown.
 cooldownBlocked = entryFreshRaw and not cooldownClear
+
+// ============================================================================
+//  LAYER ABLATION HARNESS (Stage 10)
+// ============================================================================
+//  The question no earlier stage could answer: which of the thirteen layers
+//  actually earns its weight? A layer that contributes nothing is not free -
+//  it dilutes the score, shifts where the threshold has to sit, and takes a
+//  slot in every calibration decision made from here on.
+//
+//  THE MANUAL ALTERNATIVE, AND WHY IT IS NOT ENOUGH. Every layer already has a
+//  toggle, so the test can be run by hand: turn one off, reload, read the
+//  panel. That is fourteen chart reloads per symbol with the numbers copied
+//  out by hand - and it has a trap in it, see RENORMALISATION below. The E3
+//  trailing-stop finding turned out to be symbol-dependent and two tickers
+//  could not settle it, so this test will be repeated across several names.
+//  By hand that is seventy chart reads; here it is one pass.
+//
+//  HOW IT COSTS ALMOST NOTHING. Two facts carry the whole harness:
+//
+//    1. The score is a WEIGHTED SUM, so removing layer k is closed-form -
+//       (num - ck*wk) / (den - wk). No layer is ever recomputed, and there is
+//       no ta.* call anywhere in this block.
+//    2. A signal fired at bar t has a known horizon return at bar t+H. So
+//       rather than keeping records and revisiting them - which the Stage 8
+//       log must do, because it tracks excursions and exit rules bar by bar -
+//       this looks BACKWARD H bars and settles the outcome in one step.
+//       Fourteen streams cost fourteen O(1) updates per bar: no loops, no
+//       arrays of records, no drawing objects.
+//
+//  RENORMALISATION IS FORCED ON here, whatever normalizeWeights is set to, and
+//  this is exactly the trap in the manual method. With renormalisation off,
+//  removing a layer lowers the maximum attainable score, so fewer bars clear a
+//  fixed threshold and the run measures THRESHOLD SENSITIVITY rather than the
+//  layer's contribution. Every row below - BASE included - is renormalised
+//  over its own enabled weights, so all fourteen sit on the same 0-100 scale
+//  and the threshold means the same thing in each.
+//
+//  WHAT THE STREAMS DELIBERATELY OMIT: the position filter. The live log drops
+//  any signal that arrives while a position is already open, which is a fact
+//  about timing rather than about the signal's quality. For grading entries
+//  the honest population is every accepted gate crossing. The consequence is
+//  that BASE here will NOT equal the panel's HORIZON row - it normally sees
+//  more signals. That is precisely why BASE is computed the same simplified
+//  way as the other thirteen: comparison BETWEEN ROWS is like-for-like, and
+//  that is the only comparison this section asks you to make.
+//
+//  LAYER 5 is ablated differently. It carries no weight - it is the hard veto -
+//  so its row switches the veto off instead of subtracting a weight. A
+//  different kind of question, and arguably the most interesting of the five.
+// ============================================================================
+
+// One ablated signal stream. Returns whether this bar was an accepted signal
+// for this stream, and in which direction.
+//
+// PER-CALL-SITE STATE: Pine gives every call site of a function its own
+// instance of the `var`s it declares and its own series history. The fresh-edge
+// test and the two cooldown anchors below therefore belong to THIS stream
+// alone, which is what lets one function serve all fourteen without a single
+// shared array or index.
+//
+// The parameter list is long for the same reason f_modelExit's is: everything
+// is passed in rather than read from globals, so the function has no hidden
+// dependency on which stream is calling it.
+f_ablSignal(float numL, float numS, float den, float wk, float ckL, float ckS,
+     bool layerOn, float thr, bool vetoOn, int bias,
+     bool touchL, bool touchS, bool confL, bool confS, bool entryOn,
+     bool exhL, bool exhS, bool exhOn, bool cdOn, simple int cdBars) =>
+    var int lastLong  = na
+    var int lastShort = na
+    // A layer the user has already disabled contributes nothing to either the
+    // numerator or the denominator, so there is nothing to remove: layerOn
+    // false leaves the stream identical to BASE, and the panel prints "off"
+    // for that row rather than a duplicate figure.
+    float sub = layerOn ? wk : 0.0
+    float d2  = den - sub
+    bool  ok  = d2 > 0.0
+    float sL = ok ? f_clamp((numL - (layerOn ? ckL * wk : 0.0)) / d2 * 100.0, 0.0, 100.0) : na
+    float sS = ok ? f_clamp((numS - (layerOn ? ckS * wk : 0.0)) / d2 * 100.0, 0.0, 100.0) : na
+    int   dir = not ok ? 0 : (sL > sS ? 1 : (sS > sL ? -1 : 0))
+    float raw = not ok ? 0.0 : math.max(sL, sS)
+    // The same gate chain as the live assembly above, in the same order:
+    // veto -> score armed -> entry ready -> entry signal -> fresh edge ->
+    // cooldown. Only the position filter is absent, per the header.
+    bool  vp   = not vetoOn or (bias != 0 and dir != 0 and dir == bias)
+    int   fdir = vp ? dir : 0
+    float tot  = vp ? raw : 0.0
+    bool armed = tot >= thr and fdir != 0
+    bool ready = armed and (not entryOn or
+     ((fdir > 0 ? touchL : touchS) and (fdir > 0 ? confL : confS)))
+    bool sig   = ready and (not exhOn or (fdir > 0 ? exhL : exhS))
+    bool fresh = sig and not sig[1]
+    int  last  = fdir > 0 ? lastLong : lastShort
+    bool cdOk  = not cdOn or na(last) or (bar_index - last) >= cdBars
+    bool acc   = fresh and cdOk
+    if acc
+        if fdir > 0
+            lastLong := bar_index
+        else
+            lastShort := bar_index
+    [acc, fdir]
+
+// The fourteen streams. BASE passes layerOn = false with a zero weight, so it
+// runs the identical code path with nothing removed - the control has to be
+// produced by the same machinery as the treatments or it is not a control.
+[ab0Acc, ab0Dir] = f_ablSignal(aggNumL, aggNumS, aggDen, 0.0, 0.0, 0.0, false,
+     scoreThreshold, useVeto, dBias, entryTouchLong, entryTouchShort, entryConfLong,
+     entryConfShort, useEntryTiming, exhaustLong, exhaustShort, useExhaustGate,
+     useCooldown, cooldownBars)
+[ab1Acc, ab1Dir] = f_ablSignal(aggNumL, aggNumS, aggDen, wL1, s1Long, s1Short, useL1,
+     scoreThreshold, useVeto, dBias, entryTouchLong, entryTouchShort, entryConfLong,
+     entryConfShort, useEntryTiming, exhaustLong, exhaustShort, useExhaustGate,
+     useCooldown, cooldownBars)
+[ab2Acc, ab2Dir] = f_ablSignal(aggNumL, aggNumS, aggDen, wL2, s2Long, s2Short, useL2,
+     scoreThreshold, useVeto, dBias, entryTouchLong, entryTouchShort, entryConfLong,
+     entryConfShort, useEntryTiming, exhaustLong, exhaustShort, useExhaustGate,
+     useCooldown, cooldownBars)
+[ab3Acc, ab3Dir] = f_ablSignal(aggNumL, aggNumS, aggDen, wL3, s3Long, s3Short, useL3,
+     scoreThreshold, useVeto, dBias, entryTouchLong, entryTouchShort, entryConfLong,
+     entryConfShort, useEntryTiming, exhaustLong, exhaustShort, useExhaustGate,
+     useCooldown, cooldownBars)
+[ab4Acc, ab4Dir] = f_ablSignal(aggNumL, aggNumS, aggDen, wL4, s4Both, s4Both, useL4,
+     scoreThreshold, useVeto, dBias, entryTouchLong, entryTouchShort, entryConfLong,
+     entryConfShort, useEntryTiming, exhaustLong, exhaustShort, useExhaustGate,
+     useCooldown, cooldownBars)
+// Layer 5: no weight to remove - the veto flag is what gets switched off.
+[ab5Acc, ab5Dir] = f_ablSignal(aggNumL, aggNumS, aggDen, 0.0, 0.0, 0.0, false,
+     scoreThreshold, false, dBias, entryTouchLong, entryTouchShort, entryConfLong,
+     entryConfShort, useEntryTiming, exhaustLong, exhaustShort, useExhaustGate,
+     useCooldown, cooldownBars)
+[ab6Acc, ab6Dir] = f_ablSignal(aggNumL, aggNumS, aggDen, wL6, s6Long, s6Short, useL6,
+     scoreThreshold, useVeto, dBias, entryTouchLong, entryTouchShort, entryConfLong,
+     entryConfShort, useEntryTiming, exhaustLong, exhaustShort, useExhaustGate,
+     useCooldown, cooldownBars)
+[ab7Acc, ab7Dir] = f_ablSignal(aggNumL, aggNumS, aggDen, wL7, s7Both, s7Both, useL7,
+     scoreThreshold, useVeto, dBias, entryTouchLong, entryTouchShort, entryConfLong,
+     entryConfShort, useEntryTiming, exhaustLong, exhaustShort, useExhaustGate,
+     useCooldown, cooldownBars)
+[ab8Acc, ab8Dir] = f_ablSignal(aggNumL, aggNumS, aggDen, wL8, s8Long, s8Short, useL8,
+     scoreThreshold, useVeto, dBias, entryTouchLong, entryTouchShort, entryConfLong,
+     entryConfShort, useEntryTiming, exhaustLong, exhaustShort, useExhaustGate,
+     useCooldown, cooldownBars)
+[ab9Acc, ab9Dir] = f_ablSignal(aggNumL, aggNumS, aggDen, wL9, s9Long, s9Short, useL9,
+     scoreThreshold, useVeto, dBias, entryTouchLong, entryTouchShort, entryConfLong,
+     entryConfShort, useEntryTiming, exhaustLong, exhaustShort, useExhaustGate,
+     useCooldown, cooldownBars)
+[ab10Acc, ab10Dir] = f_ablSignal(aggNumL, aggNumS, aggDen, wL10, s10Long, s10Short, useL10,
+     scoreThreshold, useVeto, dBias, entryTouchLong, entryTouchShort, entryConfLong,
+     entryConfShort, useEntryTiming, exhaustLong, exhaustShort, useExhaustGate,
+     useCooldown, cooldownBars)
+[ab11Acc, ab11Dir] = f_ablSignal(aggNumL, aggNumS, aggDen, wL11, s11Long, s11Short, useL11,
+     scoreThreshold, useVeto, dBias, entryTouchLong, entryTouchShort, entryConfLong,
+     entryConfShort, useEntryTiming, exhaustLong, exhaustShort, useExhaustGate,
+     useCooldown, cooldownBars)
+[ab12Acc, ab12Dir] = f_ablSignal(aggNumL, aggNumS, aggDen, wL12, s12Long, s12Short, useL12,
+     scoreThreshold, useVeto, dBias, entryTouchLong, entryTouchShort, entryConfLong,
+     entryConfShort, useEntryTiming, exhaustLong, exhaustShort, useExhaustGate,
+     useCooldown, cooldownBars)
+[ab13Acc, ab13Dir] = f_ablSignal(aggNumL, aggNumS, aggDen, wL13, s13Both, s13Both, useL13,
+     scoreThreshold, useVeto, dBias, entryTouchLong, entryTouchShort, entryConfLong,
+     entryConfShort, useEntryTiming, exhaustLong, exhaustShort, useExhaustGate,
+     useCooldown, cooldownBars)
+
+// Settle one stream's outcome. Quoted in R through the same f_retToR the panel
+// uses for the horizon control track, so an ablation figure and a panel figure
+// are in the same currency and can be read against each other directly.
+f_ablAccum(array<int> nA, array<int> wA, array<float> rA, int idx, bool fired, int dir,
+     float pxThen, float atrThen, float pxNow, float stopMult) =>
+    if fired and dir != 0
+        float retPct = na(pxThen) or pxThen <= 0.0 ? na :
+         (pxNow - pxThen) / pxThen * 100.0 * dir
+        float rr = f_retToR(retPct, pxThen, atrThen, stopMult)
+        // na means the ATR had not warmed up at signal time; the signal is
+        // dropped from the count rather than folded in at zero.
+        if not na(rr)
+            array.set(nA, idx, array.get(nA, idx) + 1)
+            array.set(rA, idx, array.get(rA, idx) + rr)
+            if rr > 0.0
+                array.set(wA, idx, array.get(wA, idx) + 1)
+
+// THE BACKWARD LOOK. Everything referenced here is offset by logHorizon, so
+// each bar settles the signal that fired exactly one horizon ago - the moment
+// its outcome first became knowable, and not one bar sooner.
+if bar_index > logHorizon
+    f_ablAccum(abN, abWin, abR, 0, ab0Acc[logHorizon], ab0Dir[logHorizon],
+         close[logHorizon], atrVal[logHorizon], close, exitStopATR)
+    f_ablAccum(abN, abWin, abR, 1, ab1Acc[logHorizon], ab1Dir[logHorizon],
+         close[logHorizon], atrVal[logHorizon], close, exitStopATR)
+    f_ablAccum(abN, abWin, abR, 2, ab2Acc[logHorizon], ab2Dir[logHorizon],
+         close[logHorizon], atrVal[logHorizon], close, exitStopATR)
+    f_ablAccum(abN, abWin, abR, 3, ab3Acc[logHorizon], ab3Dir[logHorizon],
+         close[logHorizon], atrVal[logHorizon], close, exitStopATR)
+    f_ablAccum(abN, abWin, abR, 4, ab4Acc[logHorizon], ab4Dir[logHorizon],
+         close[logHorizon], atrVal[logHorizon], close, exitStopATR)
+    f_ablAccum(abN, abWin, abR, 5, ab5Acc[logHorizon], ab5Dir[logHorizon],
+         close[logHorizon], atrVal[logHorizon], close, exitStopATR)
+    f_ablAccum(abN, abWin, abR, 6, ab6Acc[logHorizon], ab6Dir[logHorizon],
+         close[logHorizon], atrVal[logHorizon], close, exitStopATR)
+    f_ablAccum(abN, abWin, abR, 7, ab7Acc[logHorizon], ab7Dir[logHorizon],
+         close[logHorizon], atrVal[logHorizon], close, exitStopATR)
+    f_ablAccum(abN, abWin, abR, 8, ab8Acc[logHorizon], ab8Dir[logHorizon],
+         close[logHorizon], atrVal[logHorizon], close, exitStopATR)
+    f_ablAccum(abN, abWin, abR, 9, ab9Acc[logHorizon], ab9Dir[logHorizon],
+         close[logHorizon], atrVal[logHorizon], close, exitStopATR)
+    f_ablAccum(abN, abWin, abR, 10, ab10Acc[logHorizon], ab10Dir[logHorizon],
+         close[logHorizon], atrVal[logHorizon], close, exitStopATR)
+    f_ablAccum(abN, abWin, abR, 11, ab11Acc[logHorizon], ab11Dir[logHorizon],
+         close[logHorizon], atrVal[logHorizon], close, exitStopATR)
+    f_ablAccum(abN, abWin, abR, 12, ab12Acc[logHorizon], ab12Dir[logHorizon],
+         close[logHorizon], atrVal[logHorizon], close, exitStopATR)
+    f_ablAccum(abN, abWin, abR, 13, ab13Acc[logHorizon], ab13Dir[logHorizon],
+         close[logHorizon], atrVal[logHorizon], close, exitStopATR)
 
 // ============================================================================
 //  POSITION MANAGEMENT (Stage 8.5a)
@@ -2635,18 +2893,26 @@ var array<string> pmNames = array.from("HORIZON", "FIXED-R", "STRUCT")
 var array<int>   prN = array.new_int(9, 0)
 var array<float> prR = array.new_float(9, 0.0)
 
+// Ablation row labels, the weight each row removes, and whether that layer is
+// available to be ablated at all. Index order matches the abN / abWin / abR
+// counters exactly: 0 = BASE, 1-13 = layers 1-13. BASE and L5 remove no weight
+// - BASE removes nothing and L5 is the unweighted veto - so both show "-".
+var array<string> abNames = array.from("BASE", "L1 regime", "L2 PAC", "L3 momentum",
+     "L4 volume", "L5 veto", "L6 S/R", "L7 volatility", "L8 index", "L9 sweep",
+     "L10 divergence", "L11 candle", "L12 USDTRY", "L13 session")
+var array<float> abWts = array.from(0.0, wL1, wL2, wL3, wL4, 0.0, wL6, wL7, wL8, wL9,
+     wL10, wL11, wL12, wL13)
+var array<bool> abOn = array.from(true, useL1, useL2, useL3, useL4, useVeto, useL6, useL7,
+     useL8, useL9, useL10, useL11, useL12, useL13)
+
 // Scratch arrays for the suggested-multiple percentiles.
 var array<float> pcMae = array.new_float(0)
 var array<float> pcMfe = array.new_float(0)
 
 var table perfTable = na
 
-// The horizon track stores a percentage return; the exit tracks store R. This
-// converts the former into the latter exactly - ret% of entry IS the price
-// move - so all three rows of the comparison share one currency.
-f_retToR(float retPct, float entry, float atrAt, float stopMult) =>
-    na(retPct) or na(entry) or na(atrAt) or atrAt <= 0.0 or stopMult <= 0.0 ? na :
-     retPct / 100.0 * entry / (stopMult * atrAt)
+// f_retToR is declared with the shared helpers near the top of the file: the
+// ablation harness needs it too, and it has to exist before its first caller.
 
 f_sigBand(float score) =>
     score >= 80.0 ? 0 : (score >= 60.0 ? 1 : (score >= 40.0 ? 2 : 3))
@@ -2700,6 +2966,7 @@ if barstate.islast
         nRows := nRows + (panelShowBands ? 6 : 0)
         nRows := nRows + (panelShowModels ? 4 : 0)
         nRows := nRows + (panelShowReasons ? 9 : 0)
+        nRows := nRows + (panelShowAblation ? 15 : 0)
         nRows := nRows + (panelShowDetail ? 1 + math.max(detailN, 1) : 0)
 
         // The near-opaque ground is what actually makes the text readable:
@@ -2954,6 +3221,48 @@ if barstate.islast
                      text.align_right)
                 f_pcell(perfTable, 4, row, f_signed(avgR, "#.00"),
                      na(avgR) ? cText : (avgR > 0.0 ? cWin : cLoss), pSize, text.align_right)
+                row := row + 1
+
+        // --------------------------------------------------------- ABLATION ---
+        // Which layers earn their weight. Every row but BASE is the same system
+        // with one layer removed, measured on the horizon so no exit rule can
+        // colour the result. dR is the whole point: positive means the system
+        // scored BETTER without that layer.
+        if panelShowAblation
+            f_pcell(perfTable, 0, row, "ABLATION", cHead, pSize, text.align_left)
+            f_pcell(perfTable, 1, row, "n",     cHead, pSize, text.align_right)
+            f_pcell(perfTable, 2, row, "win%",  cHead, pSize, text.align_right)
+            f_pcell(perfTable, 3, row, "avg R", cHead, pSize, text.align_right)
+            f_pcell(perfTable, 4, row, "dR",    cHead, pSize, text.align_right)
+            f_pcell(perfTable, 5, row, "wt",    cHead, pSize, text.align_right)
+            row := row + 1
+
+            int   baseN = array.get(abN, 0)
+            float baseR = baseN > 0 ? array.get(abR, 0) / baseN : na
+
+            for k = 0 to 13
+                int n = array.get(abN, k)
+                float avgR = n > 0 ? array.get(abR, k) / n : na
+                float wr = n > 0 ? array.get(abWin, k) / (n * 1.0) * 100.0 : na
+                // A layer the user has already switched off has nothing to
+                // remove, so its stream is BASE again. Printing that number
+                // would invite a comparison that means nothing.
+                bool dead = k > 0 and not array.get(abOn, k)
+                float d = dead or k == 0 or na(avgR) or na(baseR) ? na : avgR - baseR
+                float wt = array.get(abWts, k)
+                f_pcell(perfTable, 0, row, array.get(abNames, k),
+                     k == 0 ? cHead : cText, pSize, text.align_left)
+                f_pcell(perfTable, 1, row, dead ? "-" : str.tostring(n), cText, pSize,
+                     text.align_right)
+                f_pcell(perfTable, 2, row,
+                     dead or n <= 0 ? "-" : str.tostring(wr, "#.0") + "%",
+                     cText, pSize, text.align_right)
+                f_pcell(perfTable, 3, row, dead ? "-" : f_signed(avgR, "#.00"),
+                     cText, pSize, text.align_right)
+                f_pcell(perfTable, 4, row, dead ? "off" : f_signed(d, "#.00"),
+                     na(d) ? cText : (d > 0.0 ? cWin : cLoss), pSize, text.align_right)
+                f_pcell(perfTable, 5, row, wt <= 0.0 ? "-" : str.tostring(wt, "#.#"),
+                     cText, pSize, text.align_right)
                 row := row + 1
 
         // ---------------------------------------------------- LAST SIGNALS ---
