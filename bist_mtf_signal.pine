@@ -10,8 +10,8 @@
 //  [x] Stage 2  MTF architecture (1D lock + hard veto)
 //  [x] Stage 3  1h entry timing + 15m exhaustion gate
 //  [x] Stage 4  Mid-tier layers 6-8
-//  [x] Stage 5  Advanced layers 9-13                         <-- CURRENT
-//  [ ] Stage 6  Cooldown + earnings blacklist
+//  [x] Stage 5  Advanced layers 9-13
+//  [x] Stage 6  Cooldown + earnings blacklist                <-- CURRENT
 //  [ ] Stage 7  Visuals (plotshape, colour coding, score label)
 //  [ ] Stage 8  Performance log panel
 //  [ ] Stage 9  Unified alertcondition()
@@ -193,6 +193,7 @@ const string G_L13  = "Layer 13 - Session / Time Filter"
 const string G_ENT  = "Entry Timing (1h)"
 const string G_EXH  = "Exhaustion Gate (15m)"
 const string G_CD   = "Cooldown (Anti-Whipsaw)"
+const string G_KAP  = "Earnings / KAP Blacklist"
 const string G_DISP = "Display"
 
 // ---------------------------------------------------------------- General ---
@@ -499,10 +500,36 @@ cooldownBars = input.int(4, "Bars before a new signal in the same direction", mi
      "follows whatever timeframe you run the indicator on. 0 disables the wait without disabling " +
      "the tracking.")
 
+// ------------------------------------------------- Earnings / KAP dates ---
+// Four fixed slots, per spec. Pine cannot enumerate a variable number of
+// inputs, and four covers a year of quarterly reporting - which is as far
+// ahead as a KAP calendar is ever reliable anyway.
+//
+// UNUSED SLOTS: any date at or before this sentinel counts as empty. Using a
+// sentinel rather than na keeps the input a plain date picker with no
+// "clear" affordance to explain.
+const int KAP_UNSET = 946684800000   // 2000-01-01T00:00:00Z, in milliseconds
+
+useEarningsFlag = input.bool(true, "Enable earnings risk flag", group = G_KAP,
+     tooltip = "FLAG ONLY - this never changes the score and never blocks a signal. Earnings can " +
+     "just as easily confirm a setup as destroy it, so the spec leaves the decision with you: the " +
+     "indicator's job is to make sure you knew the date was there.")
+kapWindowDays = input.int(2, "Risk window (+/- days)", minval = 1, maxval = 10, group = G_KAP,
+     tooltip = "Bars within this many days either side of a listed date are flagged. The window " +
+     "is symmetric: the run-up is as treacherous as the reaction.")
+kapDate1 = input.time(KAP_UNSET, "Earnings / KAP date 1", group = G_KAP,
+     tooltip = "Leave at the default (1 Jan 2000) to mark this slot unused.")
+kapDate2 = input.time(KAP_UNSET, "Earnings / KAP date 2", group = G_KAP)
+kapDate3 = input.time(KAP_UNSET, "Earnings / KAP date 3", group = G_KAP)
+kapDate4 = input.time(KAP_UNSET, "Earnings / KAP date 4", group = G_KAP)
+
 // ---------------------------------------------------------------- Display ---
 showComponents = input.bool(false, "Plot long / short component scores", group = G_DISP)
 showRawScore   = input.bool(false, "Plot raw pre-veto score", group = G_DISP)
 showBias       = input.bool(false, "Plot 1D bias (0 short / 50 neutral / 100 long)", group = G_DISP)
+showRisk       = input.bool(false, "Plot earnings / KAP risk flag", group = G_DISP,
+     tooltip = "Stepped trace at 110 while a bar sits inside a flagged window. Stage 7 replaces " +
+     "it with proper on-chart highlighting.")
 showGates      = input.bool(false, "Plot entry / exhaustion gate states", group = G_DISP,
      tooltip = "Stepped debug traces: score armed (30), entry ready (60), entry signal (90). " +
      "Replaced by proper markers in Stage 7.")
@@ -1484,6 +1511,36 @@ f_cooldownClear(array<int> lastBars, int dir, int nowBar, simple int bars) =>
         ok := na(last) or (nowBar - last) >= bars
     ok
 
+// ------------------------------------------------ Earnings / KAP blacklist ---
+// Within +/- kapWindowDays of a listed date the bar is flagged HIGH RISK.
+//
+// THIS IS A FLAG, NOT A GATE. It does not touch totalScore, it is not part of
+// the signal assembly below, and it cannot suppress an entry - exactly as the
+// spec requires. A result can confirm a setup as easily as it can destroy
+// one; the indicator's job is to guarantee the user knew the date was there.
+//
+// Comparison is on absolute UTC milliseconds, so it is immune to the chart's
+// timezone. The +/- window is orders of magnitude larger than any timezone
+// offset, so a date entered in the picker's timezone cannot fall out of its
+// own window at the edges.
+f_nearKapDate(int barTime, int evTime, simple int windowDays, simple int unsetBefore) =>
+    bool res = false
+    if na(barTime) or na(evTime) or evTime <= unsetBefore
+        res := false
+    else
+        res := math.abs(barTime - evTime) <= windowDays * 86400000
+    res
+
+f_earningsRisk(int barTime, int d1, int d2, int d3, int d4, simple int windowDays,
+     simple int unsetBefore) =>
+    f_nearKapDate(barTime, d1, windowDays, unsetBefore) or
+     f_nearKapDate(barTime, d2, windowDays, unsetBefore) or
+     f_nearKapDate(barTime, d3, windowDays, unsetBefore) or
+     f_nearKapDate(barTime, d4, windowDays, unsetBefore)
+
+earningsRisk = useEarningsFlag and f_earningsRisk(time, kapDate1, kapDate2, kapDate3, kapDate4,
+     kapWindowDays, KAP_UNSET)
+
 // ============================================================================
 //  SIGNAL ASSEMBLY - four sequential gates
 // ============================================================================
@@ -1546,6 +1603,10 @@ plot(showGates and entrySignal ? 90 : na, "Entry Signal", color = color.new(colo
      style = plot.style_stepline)
 plot(showGates and cooldownBlocked ? 100 : na, "Cooldown Blocked",
      color = color.new(color.red, 0), style = plot.style_stepline)
+
+// Risk flag rides above the gate traces: it annotates them, it does not gate.
+plot(showRisk and earningsRisk ? 110 : na, "Earnings Risk",
+     color = color.new(color.yellow, 0), style = plot.style_stepline)
 
 hline(scoreThreshold, "Threshold", color = color.new(color.gray, 40), linestyle = hline.style_dashed)
 hline(80, "Band 80", color = color.new(color.gray, 80), linestyle = hline.style_dotted)
