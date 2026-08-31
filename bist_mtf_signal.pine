@@ -8,8 +8,8 @@
 // ============================================================================
 //  [x] Stage 1  Core layers 1-4 + simple total score
 //  [x] Stage 2  MTF architecture (1D lock + hard veto)
-//  [x] Stage 3  1h entry timing + 15m exhaustion gate        <-- CURRENT
-//  [ ] Stage 4  Mid-tier layers 6-8
+//  [x] Stage 3  1h entry timing + 15m exhaustion gate
+//  [x] Stage 4  Mid-tier layers 6-8                          <-- CURRENT
 //  [ ] Stage 5  Advanced layers 9-13
 //  [ ] Stage 6  Cooldown + earnings blacklist
 //  [ ] Stage 7  Visuals (plotshape, colour coding, score label)
@@ -18,9 +18,10 @@
 //  [ ] Stage 10 End-to-end / repaint testing
 //
 // ============================================================================
-//  request.security() CALL INVENTORY  (Stage 3)
+//  request.security() CALL INVENTORY  (Stage 4)
 // ============================================================================
-//  COUNT: 3  (budget target for the finished script: 4-5)
+//  COUNT: 4  (budget target for the finished script: 5 - Stage 5 adds the
+//            optional USDTRY reference and nothing after that needs one)
 //
 //  #1  Directional bias lock          [Stage 2]
 //      symbol    : syminfo.tickerid          (never hardcoded)
@@ -58,6 +59,28 @@
 //                  bars rather than blanking between exhaustion-TF closes)
 //      CONSOLIDATION: RSI slope, pin/engulfing and the swing-extreme test
 //      are all resolved inside the exhaustion timeframe; four ints return.
+//
+//  #4  Market / index correlation     [Stage 4]
+//      symbol    : idxSymbol input, default "BIST:XU100"  (input.symbol, so
+//                  the index is user-selectable and never hardcoded; a user
+//                  on a delayed feed can point it at their own data source)
+//      timeframe : idxTF input, default "" = the chart timeframe, which is
+//                  what the spec means by "same timeframe"
+//      expression: f_indexExpr(off, lb) -> index % change over lb bars
+//      lookahead : barmerge.lookahead_off
+//      gaps      : barmerge.gaps_off  (the index and the stock do not always
+//                  print the same bars - half-days, halts, a name that did
+//                  not trade. gaps_on would blank the correlation on those
+//                  bars and drop the layer to neutral; gaps_off holds the
+//                  last known index move instead)
+//      CONSOLIDATION: the percentage change is computed inside the index
+//      context, so one float comes back rather than two price series.
+//      NOTE: this is a CROSS-SYMBOL call at the chart timeframe, not a
+//      higher-timeframe one. It carries no HTF repaint risk - on the
+//      realtime bar it moves exactly as the chart's own close does, and it
+//      settles when the bar closes. idxConfirmedOnly (default OFF) exists
+//      only for users who point idxTF at a HIGHER timeframe, where the
+//      developing-bar problem described above would otherwise apply.
 //
 //  Chart-timeframe work needs no security call: Heikin Ashi is derived
 //  arithmetically from the chart's own real OHLC (see the HA block below)
@@ -120,7 +143,8 @@
 //  MIXED-CANDLE POLICY (enforced from Stage 1 onward)
 // ============================================================================
 //  Heikin Ashi (optional, default ON) : PAC channel, regime EMA ordering
-//  Real OHLC (always)                 : ADX, SMA50, RSI, MACD, volume
+//  Real OHLC (always)                 : ADX, SMA50, RSI, MACD, volume, ATR,
+//                                       pivot S/R levels, index close
 //  Real OHLC (later, mandatory)       : layer 9 liquidity sweep, layer 11 candles
 // ============================================================================
 
@@ -142,6 +166,7 @@ const string G_L4   = "Layer 4 - Volume Confirmation"
 const string G_L5   = "Layer 5 - 1D Directional Lock (hard veto)"
 const string G_L6   = "Layer 6 - Structural Level Proximity (S/R)"
 const string G_L7   = "Layer 7 - Volatility Regime (ATR)"
+const string G_L8   = "Layer 8 - Market / Index Correlation"
 const string G_ENT  = "Entry Timing (1h)"
 const string G_EXH  = "Exhaustion Gate (15m)"
 const string G_DISP = "Display"
@@ -271,6 +296,29 @@ atrSlopeWeight = input.float(0.3, "Slope sub-weight", minval = 0.0, maxval = 1.0
      group = G_L7,
      tooltip = "Split of the layer between the two tests: this much on the slope, the remainder on " +
      "the level. 0.0 grades the level only, 1.0 the slope only.")
+
+// ---------------------------------------------------------------- Layer 8 ---
+useL8 = input.bool(true, "Enable Layer 8", group = G_L8)
+wL8   = input.float(5.0, "Weight", minval = 0.0, maxval = 100.0, step = 0.5, group = G_L8)
+idxSymbol = input.symbol("BIST:XU100", "Index symbol", group = G_L8,
+     tooltip = "The broad-market reference, NOT hardcoded: change it to any index or to a sector " +
+     "proxy. Users on a delayed feed should point this at the symbol their subscription provides, " +
+     "otherwise the layer stays neutral for want of data.")
+idxTF = input.timeframe("", "Index timeframe (blank = chart timeframe)", group = G_L8,
+     tooltip = "Blank means the chart's own timeframe, which is what the spec's 'same timeframe' " +
+     "comparison calls for. Setting a HIGHER timeframe here also turns on the repaint question " +
+     "described in the header - use the confirmed-bar toggle below if you do.")
+idxLookback = input.int(1, "Index return lookback (bars)", minval = 1, maxval = 100, group = G_L8,
+     tooltip = "How far back the index move is measured. 1 = this bar's own change. Raise it to " +
+     "judge the index swing rather than a single bar's noise.")
+idxNeutralPct = input.float(0.10, "Neutral band (percent move)", minval = 0.0, step = 0.05,
+     group = G_L8,
+     tooltip = "An index move smaller than this counts as directionless and scores 0.5. Without a " +
+     "band a 0.01% drift would be graded as a full agreement or a full disagreement.")
+idxConfirmedOnly = input.bool(false, "Index TF: use last CLOSED bar only", group = G_L8,
+     tooltip = "Only meaningful when the index timeframe above is HIGHER than the chart timeframe. " +
+     "At the chart timeframe the index bar closes when the chart bar does, so the offset would " +
+     "just add a bar of lag for nothing.")
 
 // ------------------------------------------------- Entry timing (1h) ---
 useEntryTiming = input.bool(true, "Enable 1h entry timing", group = G_ENT,
@@ -680,10 +728,51 @@ f_volatilityScore(float atrv, float baseline, float atrPast, float rLo, float cL
     out
 
 // ============================================================================
+//  LAYER 8 - MARKET / INDEX CORRELATION        (design weight 5)
+//  Does the broad market agree with the trade? A long into a falling XU100 is
+//  fighting the tape even when the single name looks perfect.
+//
+//  Grading is the spec's three-state one, deliberately coarse: index moving
+//  the same way -> 1.0, flat inside the neutral band -> 0.5, moving the other
+//  way -> 0.0. This is a sanity check worth 5 points, not a beta model.
+//
+//  NA GUARD: no index data (bad symbol, a feed the user is not subscribed to,
+//  or warm-up before idxLookback bars exist) -> neutral 0.5. The layer never
+//  penalises a ticker for the user's data entitlements.
+// ============================================================================
+
+// Evaluated INSIDE the index context by request.security (call #4). `off`
+// steps back one INDEX bar when idxConfirmedOnly is ON; as with the bias
+// call the shift has to happen here, not on the returned series, or it would
+// step back one CHART bar instead.
+f_indexExpr(simple int off, simple int lb) =>
+    float _prev = close[lb]
+    // Guard the denominator: an index print of exactly zero is impossible in
+    // practice but a broken or empty feed can still deliver one.
+    float _chg = na(_prev) or _prev == 0.0 ? na : (close - _prev) / _prev * 100.0
+    _chg[off]
+
+idxChgRaw = request.security(idxSymbol, idxTF,
+     f_indexExpr(idxConfirmedOnly ? 1 : 0, idxLookback),
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+f_bist100Score(int dir, float chgPct, float neutralPct) =>
+    float out = 0.5
+    if na(chgPct) or dir == 0
+        out := 0.5
+    else if math.abs(chgPct) <= neutralPct
+        out := 0.5
+    else
+        bool same = dir > 0 ? chgPct > 0.0 : chgPct < 0.0
+        out := same ? 1.0 : 0.0
+    out
+
+// ============================================================================
 //  SCORE AGGREGATION
 //  Both hypotheses are scored every bar; the stronger one becomes the
-//  candidate direction. Layers 1-4 are computed unconditionally (keeps ta.*
-//  out of conditionals); the enable toggles act at aggregation time.
+//  candidate direction. Every layer is computed unconditionally (keeps ta.*
+//  calls out of conditional branches); the enable toggles act at aggregation
+//  time. Layers 4 and 7 are non-directional and score both hypotheses alike.
 // ============================================================================
 s1Long  = f_regimeScore( 1, adxVal, adxThr, close, smaVal, emaFast, emaMed, emaSlow)
 s1Short = f_regimeScore(-1, adxVal, adxThr, close, smaVal, emaFast, emaMed, emaSlow)
@@ -704,8 +793,11 @@ s6Short = f_srProximityScore(-1, close, srSupport, srResist, atrVal, srNearAtr, 
 s7Both  = f_volatilityScore(atrVal, atrAvg, atrVal[atrSlopeLb], atrRatioLo, atrConfLo,
      atrRatioHi, atrConfHi, atrSlopeBand, atrSlopeWeight)
 
+s8Long  = f_bist100Score( 1, idxChgRaw, idxNeutralPct)
+s8Short = f_bist100Score(-1, idxChgRaw, idxNeutralPct)
+
 // No c5 parameter: layer 5 is the hard veto and carries no weight.
-f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7) =>
+f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8) =>
     float num = 0.0
     float den = 0.0
     if useL1
@@ -726,6 +818,9 @@ f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7) =>
     if useL7
         num += c7 * wL7
         den += wL7
+    if useL8
+        num += c8 * wL8
+        den += wL8
     float outv = 0.0
     if normalizeWeights
         outv := den > 0.0 ? num / den * 100.0 : 0.0
@@ -733,8 +828,8 @@ f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7) =>
         outv := num
     f_clamp(outv, 0.0, 100.0)
 
-longScore  = f_aggregate(s1Long,  s2Long,  s3Long,  s4Both, s6Long,  s7Both)
-shortScore = f_aggregate(s1Short, s2Short, s3Short, s4Both, s6Short, s7Both)
+longScore  = f_aggregate(s1Long,  s2Long,  s3Long,  s4Both, s6Long,  s7Both, s8Long)
+shortScore = f_aggregate(s1Short, s2Short, s3Short, s4Both, s6Short, s7Both, s8Short)
 
 // Candidate direction: +1 long, -1 short, 0 tie/flat.
 sigDir  = longScore > shortScore ? 1 : (shortScore > longScore ? -1 : 0)
