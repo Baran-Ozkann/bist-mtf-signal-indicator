@@ -194,6 +194,7 @@ const string G_ENT  = "Entry Timing (1h)"
 const string G_EXH  = "Exhaustion Gate (15m)"
 const string G_CD   = "Cooldown (Anti-Whipsaw)"
 const string G_KAP  = "Earnings / KAP Blacklist"
+const string G_EXIT = "Exit Logic"
 const string G_LOG  = "Performance Log"
 const string G_DISP = "Display"
 
@@ -524,6 +525,38 @@ kapDate2 = input.time(KAP_UNSET, "Earnings / KAP date 2", group = G_KAP)
 kapDate3 = input.time(KAP_UNSET, "Earnings / KAP date 3", group = G_KAP)
 kapDate4 = input.time(KAP_UNSET, "Earnings / KAP date 4", group = G_KAP)
 
+// ------------------------------------------------------------ Exit logic ---
+// Stage 8.5. The original specification is entry machinery end to end; this
+// group closes the positions it opens. Every rule is independently toggleable,
+// in the same pattern as the thirteen scoring layers.
+useExits = input.bool(true, "Enable exit logic", group = G_EXIT,
+     tooltip = "OFF returns the script to entry-only behaviour: no position is tracked, no exit " +
+     "fires, and the cooldown reverts to being measured from the entry bar.")
+
+useE1 = input.bool(true, "E1 - hard stop", group = G_EXIT,
+     tooltip = "The risk anchor. Its distance DEFINES one R, so every outcome in the panel is " +
+     "quoted against it whether or not the stop is what actually closed the trade.")
+exitStopATR = input.float(1.0, "E1 stop distance (ATR)", minval = 0.1, step = 0.1, group = G_EXIT,
+     tooltip = "PLACEHOLDER. 1.0 is a round number, not a measured one. Once the log holds resolved " +
+     "signals, set this near the 75th percentile of the panel's MAE column - a stop that survives " +
+     "three quarters of the adverse excursions that preceded a working trade.")
+
+useE2 = input.bool(true, "E2 - fixed target", group = G_EXIT)
+exitTargetATR = input.float(2.0, "E2 target distance (ATR)", minval = 0.1, step = 0.1,
+     group = G_EXIT,
+     tooltip = "PLACEHOLDER, as E1. Set it near the median of the panel's MFE column - the distance " +
+     "half of the signals actually reached.")
+
+exitStopFirst = input.bool(true, "Same bar: resolve the stop before the target", group = G_EXIT,
+     tooltip = "When one bar's range covers both levels, nothing in the data says which came " +
+     "first - Pine does not expose the intrabar sequence. Resolving the stop first is the only " +
+     "assumption that cannot flatter the result. Turn OFF to see how much of the record depends " +
+     "on that assumption.")
+exitGapFill = input.bool(true, "Gap through the stop fills at the bar open", group = G_EXIT,
+     tooltip = "A bar that opened beyond the stop never offered the stop price. With this ON the " +
+     "fill is the worse of the two, which is what actually happens on a gap. Applied to the STOP " +
+     "only: crediting the same price improvement on a target would flatter the result.")
+
 // -------------------------------------------------------- Performance log ---
 logMaxSignals = input.int(25, "Signals kept in the log", minval = 5, maxval = 100, group = G_LOG,
      tooltip = "Rolling window of the most recent accepted signals. Older ones are dropped, so the " +
@@ -605,6 +638,13 @@ type SigRec
 // ============================================================================
 //  HELPERS
 // ============================================================================
+
+// Explicit leading sign rather than a "positive;negative" format pattern, so
+// the output does not depend on how Pine handles multi-section patterns.
+// Declared here rather than with the panel formatters because the score label
+// uses it too, and the label is built earlier in the file.
+f_signed(float v, string fmt) =>
+    na(v) ? "-" : (v > 0.0 ? "+" : "") + str.tostring(v, fmt)
 
 // Clamp v into [lo, hi]. na in -> na out (callers guard before calling).
 f_clamp(float v, float lo, float hi) =>
@@ -742,6 +782,22 @@ var array<int> cdLastSignalBar = array.new_int(2, na)
 // Rolling window of the most recent accepted signals, oldest dropped first.
 var array<SigRec> sigLog = array.new<SigRec>()
 
+// -------------------------------------------- Position state (Stage 8.5) ---
+// The script was stateless about positions until this stage: it logged
+// signals and had no concept of being in one. Exits require that concept.
+// One position at a time, no pyramiding.
+//
+// posAtr freezes the ATR at entry so the stop and target never drift under an
+// open position as volatility changes.
+var int   posDir    = 0     // 0 flat, +1 long, -1 short
+var float posEntry  = na
+var float posAtr    = na
+var int   posBar    = na
+var float posStop   = na
+var float posTarget = na
+var float posMfe    = 0.0
+var float posMae    = 0.0
+
 // ------------------------------------------------ Score reach (Stage 8) ---
 // How high the score ACTUALLY gets on this symbol, counted over every warmed
 // -up bar rather than only over bars that signalled. This exists to answer a
@@ -777,6 +833,14 @@ if syminfo.ticker != srTicker
     array.clear(srLows)
     array.fill(cdLastSignalBar, na)
     array.clear(sigLog)
+    posDir    := 0
+    posEntry  := na
+    posAtr    := na
+    posBar    := na
+    posStop   := na
+    posTarget := na
+    posMfe    := 0.0
+    posMae    := 0.0
     array.fill(reachRaw,   0)
     array.fill(reachFinal, 0)
     reachBars := 0
@@ -1638,6 +1702,54 @@ f_earningsRisk(int barTime, int d1, int d2, int d3, int d4, simple int windowDay
 earningsRisk = useEarningsFlag and f_earningsRisk(time, kapDate1, kapDate2, kapDate3, kapDate4,
      kapWindowDays, KAP_UNSET)
 
+// ------------------------------------------------------------ Exit rules ---
+// Reason codes double as the resolution order: when several rules fire on one
+// bar the lowest code wins. Stops before targets, structure before the time
+// stop, so a genuine reason always beats the backstop.
+//   1 stop      2 target    3 trail     4 score decay
+//   5 bias flip 6 PAC cross 7 opposite  8 time stop
+// Codes 3 to 8 are declared here and wired in 8.5b.
+const int EXIT_NONE     = 0
+const int EXIT_STOP     = 1
+const int EXIT_TARGET   = 2
+const int EXIT_TRAIL    = 3
+const int EXIT_SCORE    = 4
+const int EXIT_BIAS     = 5
+const int EXIT_PAC      = 6
+const int EXIT_OPPOSITE = 7
+const int EXIT_TIME     = 8
+
+f_exitName(int reason) =>
+    reason == EXIT_STOP     ? "stop"     :
+     reason == EXIT_TARGET   ? "target"   :
+     reason == EXIT_TRAIL    ? "trail"    :
+     reason == EXIT_SCORE    ? "decay"    :
+     reason == EXIT_BIAS     ? "bias"     :
+     reason == EXIT_PAC      ? "PAC"      :
+     reason == EXIT_OPPOSITE ? "opposite" :
+     reason == EXIT_TIME     ? "time"     : "-"
+
+// Fixed-R exit test: E1 and E2 only. Pure, so the live position and the
+// per-signal simulation added in 8.5c can share one implementation and cannot
+// drift apart.
+//
+// Returns [reason, fill]. A flat direction or missing levels return no exit.
+f_fixedExit(int dir, float stop, float target, bool eStop, bool eTarget, bool stopFirst,
+     bool gapFill, float o, float h, float l) =>
+    int reason = EXIT_NONE
+    float fill = na
+    if dir != 0
+        bool hitStop   = eStop   and not na(stop)   and (dir > 0 ? l <= stop   : h >= stop)
+        bool hitTarget = eTarget and not na(target) and (dir > 0 ? h >= target : l <= target)
+        if hitStop and (not hitTarget or stopFirst)
+            reason := EXIT_STOP
+            // A bar that opened beyond the level never offered the level.
+            fill := gapFill ? (dir > 0 ? math.min(stop, o) : math.max(stop, o)) : stop
+        else if hitTarget
+            reason := EXIT_TARGET
+            fill := target
+    [reason, fill]
+
 // ============================================================================
 //  SIGNAL ASSEMBLY - four sequential gates
 // ============================================================================
@@ -1672,13 +1784,103 @@ entrySignalFresh = entryFreshRaw and cooldownClear
 // Diagnostic: a setup that completed but was refused by the cooldown.
 cooldownBlocked = entryFreshRaw and not cooldownClear
 
-// Record the acceptance. A setup refused here must go quiet and re-form to
-// signal again - the cooldown does not queue a blocked signal and release it
-// when the timer expires, because by then the setup that produced it is
-// stale. Pine re-runs the current bar from the last committed state on every
-// realtime tick, so an intrabar flicker cannot leave a false entry behind.
-if entrySignalFresh and finalDir != 0
-    array.set(cdLastSignalBar, finalDir > 0 ? 0 : 1, bar_index)
+// ============================================================================
+//  POSITION MANAGEMENT (Stage 8.5a)
+// ============================================================================
+//  Order within a bar is deliberate: the open position is managed FIRST, then
+//  a new entry is considered. That is the order a trader operates in, and it
+//  means the exit bar's own high and low are judged against the levels that
+//  were live during it rather than against levels a same-bar re-entry set.
+//
+//  The entry bar itself can never trigger an exit. Entry is that bar's close,
+//  so the bar's own high and low were not reachable from it - the same
+//  reasoning that keeps the signal bar out of the MFE/MAE window.
+// ============================================================================
+
+// Evaluated unconditionally at global scope - never inside a branch. The
+// guards below decide whether the verdict is acted on. When flat, posDir is 0
+// and the function returns no exit.
+[fxReason, fxFill] = f_fixedExit(posDir, posStop, posTarget, useE1, useE2, exitStopFirst,
+     exitGapFill, open, high, low)
+
+int   exitReason   = EXIT_NONE
+float exitFill     = na
+float exitR        = na
+bool  exitFired    = false
+int   exitDirWas   = 0
+float exitEntryWas = na
+int   exitBarsHeld = 0
+
+// Toggling exits off mid-chart must not strand an open position forever.
+if not useExits and posDir != 0
+    posDir    := 0
+    posEntry  := na
+    posAtr    := na
+    posBar    := na
+    posStop   := na
+    posTarget := na
+
+// ------------------------------------------------ 1. Manage what is open ---
+if useExits and posDir != 0
+    int age = bar_index - posBar
+    if age > 0
+        posMfe := math.max(posMfe, posDir > 0 ? high - posEntry : posEntry - low)
+        posMae := math.max(posMae, posDir > 0 ? posEntry - low  : high - posEntry)
+        if fxReason != EXIT_NONE
+            exitReason   := fxReason
+            exitFill     := fxFill
+            exitFired    := true
+            exitDirWas   := posDir
+            exitEntryWas := posEntry
+            exitBarsHeld := age
+            // R is quoted against the E1 stop distance whatever closed the
+            // trade, so every exit rule is measured in the same currency.
+            float oneR = na(posAtr) or posAtr <= 0.0 ? na : exitStopATR * posAtr
+            exitR := na(oneR) or oneR <= 0.0 ? na : (exitFill - posEntry) * posDir / oneR
+            posDir    := 0
+            posEntry  := na
+            posAtr    := na
+            posBar    := na
+            posStop   := na
+            posTarget := na
+
+// --------------------------------------------- 2. Then consider an entry ---
+// A signal arriving while a position is open is ignored - no pyramiding, and
+// no reversal in one step. Re-entry is also barred on the exit bar itself: a
+// position closes and the next opportunity is the following bar at the
+// earliest, which keeps the cooldown from being sidestepped by an exit and a
+// re-entry landing on the same bar.
+entryAccepted = entrySignalFresh and (not useExits or (posDir == 0 and not exitFired))
+
+if useExits and entryAccepted and finalDir != 0
+    posDir    := finalDir
+    posEntry  := close
+    posAtr    := atrVal
+    posBar    := bar_index
+    posMfe    := 0.0
+    posMae    := 0.0
+    posStop   := na(atrVal) ? na :
+     (finalDir > 0 ? close - exitStopATR * atrVal : close + exitStopATR * atrVal)
+    posTarget := na(atrVal) ? na :
+     (finalDir > 0 ? close + exitTargetATR * atrVal : close - exitTargetATR * atrVal)
+
+// ------------------------------------------------------- Cooldown anchor ---
+// D7: anchored at the EXIT once exits exist. While a position is open the
+// position itself blocks re-entry, so an entry-anchored timer would be inert
+// exactly when it is supposed to be counting. With exits disabled the Stage 6
+// entry-anchored behaviour is preserved unchanged.
+//
+// A setup refused by the cooldown must go quiet and re-form to signal again -
+// the cooldown does not queue a blocked signal and release it when the timer
+// expires, because by then the setup that produced it is stale. Pine re-runs
+// the current bar from the last committed state on every realtime tick, so an
+// intrabar flicker cannot leave a false entry behind.
+if useExits
+    if exitFired and exitDirWas != 0
+        array.set(cdLastSignalBar, exitDirWas > 0 ? 0 : 1, bar_index)
+else
+    if entryAccepted and finalDir != 0
+        array.set(cdLastSignalBar, finalDir > 0 ? 0 : 1, bar_index)
 
 // ============================================================================
 //  PERFORMANCE LOG - signal recording and outcome tracking (Stage 8)
@@ -1698,7 +1900,7 @@ if entrySignalFresh and finalDir != 0
 //  with MFE 2.5 ATR and MAE 0.4 ATR wants a wide target and a tight stop,
 //  and one with the reverse wants neither. The panel reports them per band.
 // ============================================================================
-if entrySignalFresh and finalDir != 0
+if entryAccepted and finalDir != 0
     array.push(sigLog, SigRec.new(barIdx = bar_index, tm = time, dir = finalDir,
          score = totalScore, entry = close, atrAt = atrVal, mfe = 0.0, mae = 0.0,
          ret = na, resolved = false))
@@ -1792,16 +1994,16 @@ fill(pScore, pZero, color = color.new(f_dirColor(finalDir), 88), title = "Score 
 // REALTIME NOTE: these follow entrySignalFresh, which can move within a
 // forming bar. See the ENTRY GATE TIMING block in the header; judge signals
 // on chart-bar close.
-plotshape(showEntrySignals and entrySignalFresh and finalDir > 0, "Long Entry",
+plotshape(showEntrySignals and entryAccepted and finalDir > 0, "Long Entry",
      shape.triangleup, location.belowbar, color = color.new(color.teal, 0),
      size = size.small, force_overlay = true)
-plotshape(showEntrySignals and entrySignalFresh and finalDir < 0, "Short Entry",
+plotshape(showEntrySignals and entryAccepted and finalDir < 0, "Short Entry",
      shape.triangledown, location.abovebar, color = color.new(color.maroon, 0),
      size = size.small, force_overlay = true)
 
 // A signal that landed inside an earnings window still fires - the flag never
 // gates - but it is marked so the user cannot take it without noticing.
-plotchar(showEntrySignals and entrySignalFresh and earningsRisk, "Entry in earnings window",
+plotchar(showEntrySignals and entryAccepted and earningsRisk, "Entry in earnings window",
      "!", location.top, color = color.new(color.orange, 0), size = size.tiny,
      force_overlay = true)
 
@@ -1828,8 +2030,16 @@ if barstate.islast
         // Ordered most-advanced first, so the first match is the furthest the
         // setup actually got.
         string stateTxt = "below threshold"
-        if entrySignalFresh
+        if entryAccepted
             stateTxt := "ENTRY SIGNAL"
+        else if exitFired
+            stateTxt := "EXIT - " + f_exitName(exitReason) +
+             (na(exitR) ? "" : "  " + f_signed(exitR, "#.00") + "R")
+        else if posDir != 0
+            stateTxt := "in " + (posDir > 0 ? "LONG" : "SHORT") + ", " +
+             str.tostring(bar_index - posBar) + " bars held"
+        else if entrySignalFresh
+            stateTxt := "signal suppressed - position already open"
         else if cooldownBlocked
             stateTxt := "setup blocked by cooldown"
         else if entrySignal
@@ -1969,11 +2179,6 @@ f_pctStr(float part, float total) =>
 
 f_avgStr(float total, float n, string fmt) =>
     n <= 0.0 ? "-" : str.tostring(total / n, fmt)
-
-// Explicit leading sign rather than a "positive;negative" format pattern, so
-// the output does not depend on how Pine handles multi-section patterns.
-f_signed(float v, string fmt) =>
-    na(v) ? "-" : (v > 0.0 ? "+" : "") + str.tostring(v, fmt)
 
 f_avgSigned(float total, float n) =>
     n <= 0.0 ? "-" : f_signed(total / n, "#.00")
