@@ -9,8 +9,8 @@
 //  [x] Stage 1  Core layers 1-4 + simple total score
 //  [x] Stage 2  MTF architecture (1D lock + hard veto)
 //  [x] Stage 3  1h entry timing + 15m exhaustion gate
-//  [x] Stage 4  Mid-tier layers 6-8                          <-- CURRENT
-//  [ ] Stage 5  Advanced layers 9-13
+//  [x] Stage 4  Mid-tier layers 6-8
+//  [x] Stage 5  Advanced layers 9-13                         <-- CURRENT
 //  [ ] Stage 6  Cooldown + earnings blacklist
 //  [ ] Stage 7  Visuals (plotshape, colour coding, score label)
 //  [ ] Stage 8  Performance log panel
@@ -189,19 +189,22 @@ const string G_L9   = "Layer 9 - Liquidity Sweep"
 const string G_L10  = "Layer 10 - RSI / Price Divergence"
 const string G_L11  = "Layer 11 - Candle Pattern Confirmation"
 const string G_L12  = "Layer 12 - USDTRY Correlation (optional)"
+const string G_L13  = "Layer 13 - Session / Time Filter"
 const string G_ENT  = "Entry Timing (1h)"
 const string G_EXH  = "Exhaustion Gate (15m)"
 const string G_DISP = "Display"
 
 // ---------------------------------------------------------------- General ---
 scoreThreshold = input.int(70, "Signal score threshold", minval = 1, maxval = 100, group = G_GEN,
-     tooltip = "Reference line only in Stage 1. Becomes the live signal trigger in Stage 9.")
+     tooltip = "The score a candidate must reach before the entry timeframe is consulted at " +
+     "all. Already live: it drives the scoreArmed gate. Stage 9 attaches the unified alert to " +
+     "the same crossing.")
 normalizeWeights = input.bool(true, "Renormalise score across ENABLED layers only", group = G_GEN,
      tooltip = "WEIGHT REDISTRIBUTION: total design weight is 100 across all 13 layers. " +
      "With this ON the score is divided by the sum of enabled weights, so it always spans 0-100. " +
      "With it OFF the raw weighted sum is shown, so disabling a layer removes its contribution " +
-     "WITHOUT redistributing it and the maximum drops below 100. Note that not every layer has " +
-     "shipped yet, so the sum of live weights is still under 100 either way.")
+     "WITHOUT redistributing it and the maximum drops below 100. All 13 layers now ship; with " +
+     "default settings the live weights total 95 of 100, because layer 12 (USDTRY) is off.")
 atrLen = input.int(14, "ATR length (shared by layers 6 and 7)", minval = 1, group = G_GEN,
      tooltip = "One ATR series feeds both the S/R distance normalisation (layer 6) and the " +
      "volatility regime test (layer 7), so the two layers cannot disagree about what one ATR means. " +
@@ -429,6 +432,25 @@ fxNeutralPct = input.float(0.10, "Neutral band (percent move)", minval = 0.0, st
 fxConfirmedOnly = input.bool(false, "FX TF: use last CLOSED bar only", group = G_L12,
      tooltip = "Only meaningful if the FX timeframe above is HIGHER than the chart timeframe - " +
      "same reasoning as the index layer.")
+
+// --------------------------------------------------------------- Layer 13 ---
+useL13 = input.bool(true, "Enable Layer 13", group = G_L13)
+wL13   = input.float(5.0, "Weight", minval = 0.0, maxval = 100.0, step = 0.5, group = G_L13)
+sessTz = input.string("Europe/Istanbul", "Session timezone", group = G_L13,
+     tooltip = "TIMEZONE AWARENESS: the windows below are read in THIS timezone, not the chart's " +
+     "and not the exchange's default. A user viewing BIST from a UTC chart gets the same " +
+     "classification as one on an Istanbul chart. Change it only if you deliberately want the " +
+     "windows interpreted somewhere else.")
+sessOpenWin = input.session("1000-1015", "Opening window", group = G_L13,
+     tooltip = "The auction hangover: wide spreads and unreliable direction.")
+sessLunchWin = input.session("1230-1330", "Lunch window", group = G_L13,
+     tooltip = "Thin volume; breakouts here fail more often than they follow through.")
+sessCloseWin = input.session("1730-1800", "Closing window", group = G_L13,
+     tooltip = "Position squaring rather than fresh conviction.")
+sessPenalty = input.float(0.3, "Confidence inside a flagged window", minval = 0.0, maxval = 1.0,
+     step = 0.05, group = G_L13,
+     tooltip = "Bars inside any of the three windows score this instead of 1.0. It is a penalty, " +
+     "not a block - the spec deliberately keeps it as a weighted layer rather than a veto.")
 
 // ------------------------------------------------- Entry timing (1h) ---
 useEntryTiming = input.bool(true, "Enable 1h entry timing", group = G_ENT,
@@ -1112,11 +1134,48 @@ f_usdtryScore(int dir, float chgPct, float neutralPct, int linkSign) =>
     out
 
 // ============================================================================
+//  LAYER 13 - SESSION / TIME FILTER            (design weight 5)
+//  Bars inside the opening auction hangover, the lunch lull, or the closing
+//  squaring window score sessPenalty (0.3); every other bar scores 1.0.
+//  Non-directional - a bad hour is bad for longs and shorts alike.
+//
+//  TIMEZONE AWARENESS: time(timeframe.period, session, sessTz) resolves the
+//  window in the user-selected timezone, so the layer behaves identically
+//  whether the chart is set to Istanbul, UTC or New York. Comparing raw
+//  hour()/minute() against the chart's local time would silently misfire for
+//  anyone not on exchange time - exactly the failure the spec calls out.
+//
+//  HALF-DAYS: nothing here assumes a session runs 10:00-18:00. Each window is
+//  a time-of-day test evaluated against whatever bars the exchange actually
+//  produced, so a half-day simply has fewer bars to classify and no window is
+//  ever "missed" because the day ended early.
+//
+//  TIMEFRAME CAVEAT: time() flags a bar when the bar's OPEN falls inside the
+//  window. On the recommended 4h chart only the opening window can therefore
+//  match (a 4h bar opens at 10:00, but none opens at 12:30 or 17:30), so the
+//  layer effectively penalises the day's first bar and nothing else. That is
+//  the graceful degradation, and it is the reason for choosing this test over
+//  a bar-span overlap: an overlap test on a 4h chart would flag EVERY bar,
+//  since a 10:00-14:00 bar overlaps both the opening and the lunch window.
+//  These windows are built for intraday work - on a 15m or 1h chart all three
+//  behave as intended.
+// ============================================================================
+inSessOpen  = not na(time(timeframe.period, sessOpenWin,  sessTz))
+inSessLunch = not na(time(timeframe.period, sessLunchWin, sessTz))
+inSessClose = not na(time(timeframe.period, sessCloseWin, sessTz))
+sessFlagged = inSessOpen or inSessLunch or inSessClose
+
+f_sessionFilterScore(bool flagged, float penalty) =>
+    f_clamp(flagged ? penalty : 1.0, 0.0, 1.0)
+
+// ============================================================================
 //  SCORE AGGREGATION
 //  Both hypotheses are scored every bar; the stronger one becomes the
 //  candidate direction. Every layer is computed unconditionally (keeps ta.*
 //  calls out of conditional branches); the enable toggles act at aggregation
-//  time. Layers 4 and 7 are non-directional and score both hypotheses alike.
+//  time. Layers 4, 7 and 13 are non-directional and score both hypotheses
+//  alike. With all 13 layers shipped the design weights sum to exactly 100
+//  (layer 5 is the veto and carries none).
 // ============================================================================
 s1Long  = f_regimeScore( 1, adxVal, adxThr, close, smaVal, emaFast, emaMed, emaSlow)
 s1Short = f_regimeScore(-1, adxVal, adxThr, close, smaVal, emaFast, emaMed, emaSlow)
@@ -1159,9 +1218,11 @@ s11Short = f_candlePatternScore(-1, open, high, low, close, open[1], close[1],
 s12Long  = f_usdtryScore( 1, fxChgRaw, fxNeutralPct, fxSign)
 s12Short = f_usdtryScore(-1, fxChgRaw, fxNeutralPct, fxSign)
 
+s13Both  = f_sessionFilterScore(sessFlagged, sessPenalty)
+
 // No c5 parameter: layer 5 is the hard veto and carries no weight.
 f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8,
-     float c9, float c10, float c11, float c12) =>
+     float c9, float c10, float c11, float c12, float c13) =>
     float num = 0.0
     float den = 0.0
     if useL1
@@ -1197,6 +1258,9 @@ f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8
     if useL12
         num += c12 * wL12
         den += wL12
+    if useL13
+        num += c13 * wL13
+        den += wL13
     float outv = 0.0
     if normalizeWeights
         outv := den > 0.0 ? num / den * 100.0 : 0.0
@@ -1205,9 +1269,9 @@ f_aggregate(float c1, float c2, float c3, float c4, float c6, float c7, float c8
     f_clamp(outv, 0.0, 100.0)
 
 longScore  = f_aggregate(s1Long,  s2Long,  s3Long,  s4Both, s6Long,  s7Both, s8Long,
-     s9Long,  s10Long,  s11Long,  s12Long)
+     s9Long,  s10Long,  s11Long,  s12Long,  s13Both)
 shortScore = f_aggregate(s1Short, s2Short, s3Short, s4Both, s6Short, s7Both, s8Short,
-     s9Short, s10Short, s11Short, s12Short)
+     s9Short, s10Short, s11Short, s12Short, s13Both)
 
 // Candidate direction: +1 long, -1 short, 0 tie/flat.
 sigDir  = longScore > shortScore ? 1 : (shortScore > longScore ? -1 : 0)
