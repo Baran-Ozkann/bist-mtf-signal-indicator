@@ -91,12 +91,12 @@ than of exit quality.
 |---|---|---|---|---|
 | E1 | Hard stop | Both | On | `exitStopATR` 1.0 |
 | E2 | Fixed target | Fixed-R | On | `exitTargetATR` 2.0 |
-| E3 | Trailing stop | Both | Off | `exitTrailATR` 1.5 |
+| E3 | Trailing stop | Both | On | `exitTrailATR` 3.0 |
 | E4 | Score decay | Structural | On | `exitScoreFloor` 40, `exitScoreBars` 2 |
 | E5 | 1D bias flip | Structural | On | — |
 | E6 | PAC cross against | Structural | On | `exitPacLine` mid |
 | E7 | Opposite signal | Structural | On | — |
-| E8 | Time stop | Both | On | `exitMaxBars` 40 |
+| E8 | Time stop | Both | On | `exitMaxBars` 250 |
 
 Notes on individual rules:
 
@@ -132,7 +132,12 @@ Notes on individual rules:
 - **E6** compares the same candle source the PAC is built from, so the test
   does not mix real and Heikin Ashi closes.
 - **E8** backstops both models, guaranteeing every position resolves so the
-  panel cannot fill with trades that never end.
+  panel cannot fill with trades that never end. It is a backstop, not a
+  decision: at the original 40 bars — roughly a calendar month on a 4h BIST
+  chart — it was truncating trends rather than catching stuck positions, and
+  a quarter of structural exits were hitting it. Raised to 250, which costs
+  the fixed-R model nothing since a 1 ATR stop and 2 ATR target resolve long
+  before it.
 
 `exitStopATR` and `exitTargetATR` ship as **placeholders**. See §12.
 
@@ -307,10 +312,14 @@ excursion window described in §6.
 | D3 | Gap through the stop fills where? | Worse of stop level and bar open |
 | D4 | E5 on neutral bias, or opposite only? | Opposite only |
 | D5 | E6 line — mid or opposite band? | Mid, configurable |
-| D6 | Live model by default? | Fixed-R |
+| D6 | Live model by default? | ~~Fixed-R~~ → **Structural** |
 | D7 | Cooldown anchored at entry or exit? | Exit |
 | D8 | Separate exit alert in Stage 9? | Yes |
 | D9 | Observed MFE/MAE for E1/E2 defaults? | **Deferred** |
+
+**D6 was revised after testing.** The live model default is now Structural.
+Fixed-R was chosen as the simpler baseline to judge against; once E3 became
+shared, the structural model was the one worth watching on the chart.
 
 **D9 is open.** At the 70 threshold the panel held essentially no resolved
 signals, so there was no distribution to read — the readings needed to

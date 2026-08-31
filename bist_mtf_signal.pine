@@ -542,7 +542,8 @@ kapDate4 = input.time(KAP_UNSET, "Earnings / KAP date 4", group = G_KAP)
 useExits = input.bool(true, "Enable exit logic", group = G_EXIT,
      tooltip = "OFF returns the script to entry-only behaviour: no position is tracked, no exit " +
      "fires, and the cooldown reverts to being measured from the entry bar.")
-exitLiveModelStr = input.string("Fixed-R", "Live exit model", options = ["Fixed-R", "Structural"],
+exitLiveModelStr = input.string("Structural", "Live exit model",
+     options = ["Fixed-R", "Structural"],
      group = G_EXIT,
      tooltip = "Which model actually closes the live position and drives the chart markers.\n\n" +
      "FIXED-R  : E1 stop, E2 target, optional E3 trail, E8 backstop. Mechanical - it knows nothing " +
@@ -550,7 +551,8 @@ exitLiveModelStr = input.string("Fixed-R", "Live exit model", options = ["Fixed-
      "STRUCTURAL: E1 stop kept as a floor, then E4-E7. Holds while the reasoning that opened the " +
      "position still stands.\n\n" +
      "Both are measured on every signal regardless of this setting (8.5c), so the panel compares " +
-     "them without you having to switch.")
+     "them without you having to switch - this only decides which one closes the live position " +
+     "and drives the markers and alerts.")
 
 useE1 = input.bool(true, "E1 - hard stop", group = G_EXIT,
      tooltip = "The risk anchor. Its distance DEFINES one R, so every outcome in the panel is " +
@@ -576,17 +578,25 @@ exitGapFill = input.bool(true, "Gap through the stop fills at the bar open", gro
      "fill is the worse of the two, which is what actually happens on a gap. Applied to the STOP " +
      "only: crediting the same price improvement on a target would flatter the result.")
 
-useE3 = input.bool(false, "E3 - trailing stop", group = G_EXIT,
+useE3 = input.bool(true, "E3 - trailing stop", group = G_EXIT,
      tooltip = "Available to BOTH models - it is the only rule that lets a position be HELD rather " +
      "than closed, so binding it to one track left the structural model with nothing but exit " +
      "rules and no way to ride a trend.\n\n" +
      "On the structural track it is the trailing FLOOR: E4-E7 stay live as early-exit overrides " +
      "and close the position first whenever the case for it dissolves.\n\n" +
-     "OFF by default so the fixed-R baseline stays the clean two-rule model it was measured as. " +
-     "See the trail geometry note in the position management block before setting the distance.")
-exitTrailATR = input.float(1.5, "E3 trail distance (ATR)", minval = 0.1, step = 0.1, group = G_EXIT,
-     tooltip = "Distance held below the best price reached so far. The trail ratchets on CLOSED " +
-     "bars only - see the note in the position management block.")
+     "NOTE that this is shared, so switching it on also changes the fixed-R model from a two-rule " +
+     "stop-and-target into a three-rule one. Any fixed-R numbers recorded before it was enabled " +
+     "are not comparable with the ones recorded after.")
+exitTrailATR = input.float(3.0, "E3 trail distance (ATR)", minval = 0.1, step = 0.1,
+     group = G_EXIT,
+     tooltip = "Distance held below the best price reached so far. Ratchets on CLOSED bars only.\n\n" +
+     "3.0 against a 1.0 hard stop means the trail takes over once the trade has run 2 ATR in " +
+     "favour, reaches breakeven at 3 ATR and locks 1R at 4 ATR. A tighter trail exits on ordinary " +
+     "consolidation - pullbacks inside a trend routinely run 1 to 2 ATR - which is how a trailing " +
+     "stop ends up cutting exactly the trends it exists to ride.\n\n" +
+     "The full geometry is in the position management block. Do NOT set this from the panel's " +
+     "suggested-target figure: that is computed from the horizon-bounded excursion and understates " +
+     "what a trend offers.")
 
 useE4 = input.bool(true, "E4 - score decay", group = G_EXIT,
      tooltip = "Exits when the case for the position has dissolved: the directional score has sat " +
@@ -616,7 +626,12 @@ useE7 = input.bool(true, "E7 - opposite signal", group = G_EXIT,
 useE8 = input.bool(true, "E8 - time stop", group = G_EXIT,
      tooltip = "Backstop for BOTH models. Guarantees every position resolves, so the panel cannot " +
      "fill with trades that never end.")
-exitMaxBars = input.int(40, "E8 max bars held", minval = 1, maxval = 500, group = G_EXIT)
+exitMaxBars = input.int(250, "E8 max bars held", minval = 1, maxval = 500, group = G_EXIT,
+     tooltip = "A BACKSTOP, not a decision. At 40 bars it was neither: on a 4h BIST chart that is " +
+     "roughly a calendar month, so it was truncating trends rather than catching stuck positions, " +
+     "and a quarter of structural exits were hitting it.\n\n" +
+     "250 costs the fixed-R model nothing - with a 1 ATR stop and a 2 ATR target those trades " +
+     "resolve long before it - so raising it only frees the structural model to hold.")
 
 // -------------------------------------------------------- Performance log ---
 logMaxSignals = input.int(25, "Signals kept in the log", minval = 5, maxval = 100, group = G_LOG,
@@ -2583,10 +2598,15 @@ if barstate.islast
          (panelPosStr == "Middle right" ? position.middle_right :
          (panelPosStr == "Bottom right" ? position.bottom_right : position.bottom_left))
 
-        color cHead = color.new(color.gray, 0)
+        // LEGIBILITY: the panel used a flat mid-grey for headers and drew over
+        // whatever candles happened to be behind it. Both are fixed here - the
+        // table gets its own near-opaque ground below, and every text colour is
+        // derived from chart.fg_color so it tracks the user's theme instead of
+        // assuming a dark one.
         color cText = chart.fg_color
+        color cHead = color.new(chart.fg_color, 30)
         color cWin  = color.new(color.teal, 0)
-        color cLoss = color.new(color.maroon, 0)
+        color cLoss = color.new(color.red, 0)
 
         int logN = array.size(sigLog)
         int detailN = math.min(panelDetailRows, logN)
@@ -2600,9 +2620,12 @@ if barstate.islast
         nRows := nRows + (panelShowReasons ? 9 : 0)
         nRows := nRows + (panelShowDetail ? 1 + math.max(detailN, 1) : 0)
 
-        perfTable := table.new(pPos, PANEL_COLS, nRows, border_width = 1,
-             frame_color = color.new(color.gray, 60), frame_width = 1,
-             border_color = color.new(color.gray, 80))
+        // The near-opaque ground is what actually makes the text readable:
+        // transparent cells put every figure on top of moving candles.
+        perfTable := table.new(pPos, PANEL_COLS, nRows,
+             bgcolor = color.new(chart.bg_color, 8), border_width = 1,
+             frame_color = color.new(chart.fg_color, 70), frame_width = 1,
+             border_color = color.new(chart.fg_color, 85))
 
         int row = 0
         f_pcell(perfTable, 0, row, "BIST MTF   " + str.tostring(logN) + " logged / " +
