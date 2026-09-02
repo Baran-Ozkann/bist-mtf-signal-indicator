@@ -13,6 +13,97 @@ it is not enough to call anything settled.
 
 ---
 
+## The headline finding — the layers do not earn their place, and the system loses to buy-and-hold
+
+Measured across six BIST tickers with the ablation harness, after the harness
+was validated against the manual method (§1c). Three results, all negative, all
+pointing the same way.
+
+### 1. Eleven of thirteen layers show no measurable contribution
+
+`dR` is the change in average R per signal when the layer is removed, with
+*Renormalise* on. **Negative means the layer helps; positive means it hurts.**
+L1 was disabled in all six runs, after the BIMAS finding below.
+
+| Layer | TUPRS | TOASO | ASELS | GARAN | THYAO | EREGL | helps |
+|---|---|---|---|---|---|---|---|
+| L5 veto | −1.53 | +0.03 | −0.37 | −0.16 | −0.62 | −0.07 | **5/6** |
+| L3 momentum | −0.14 | −0.01 | −0.04 | +0.13 | −0.52 | −0.12 | **5/6** |
+| L10 divergence | −0.27 | +0.18 | −0.29 | −0.18 | −0.20 | +0.05 | 4/6 |
+| L4 volume | −0.34 | +0.31 | +0.06 | −0.02 | −0.32 | −0.05 | 4/6 |
+| L11 candle | −0.13 | +0.25 | −0.29 | −0.15 | −0.28 | +0.20 | 4/6 |
+| L8 index | −0.10 | +0.39 | −0.07 | −0.22 | +0.31 | −0.10 | 4/6 |
+| L6 S/R | −0.08 | +0.24 | −0.05 | −0.24 | +0.37 | +0.31 | 3/6 |
+| L7 volatility | −0.09 | +0.04 | −0.18 | −0.08 | +0.09 | +0.04 | 3/6 |
+| L9 sweep | −0.06 | +0.47 | −0.31 | −0.37 | +0.40 | +0.25 | 3/6 |
+| L2 PAC | −0.36 | +0.33 | −0.06 | +0.06 | +0.07 | +0.02 | 2/6 |
+| L13 session | −0.10 | +0.22 | +0.05 | −0.26 | +0.40 | +0.25 | 2/6 |
+
+Only two layers hold a consistent sign: **L5, the veto, and L3, momentum**,
+both 5/6. The other nine flip sign from ticker to ticker. At n≈30–60 signals
+per ticker, that is what a coin flip looks like. Nine layers of code, weight
+and tuning surface produce nothing that shows up in the results.
+
+### 2. The heaviest layer is actively harmful on at least one ticker
+
+L1, the regime layer, carries **weight 20** — the largest single allocation in
+the system, and the one the whole scoring scheme leans on hardest. On BIMAS,
+removing it raised *both* average R and win rate.
+
+This is the one result confirmed by hand rather than by the harness alone:
+disabling L1 manually moved `HORIZON` from **+0.19 to +0.71**, against the
+harness's predicted +0.26 — same sign, larger magnitude, which is the expected
+direction of disagreement (§1c). L1 was left disabled for every subsequent
+ablation run.
+
+### 3. The system loses to buy-and-hold on every ticker tested
+
+| Ticker | Buy-and-hold | System |
+|---|---|---|
+| ASELS | **+24468 R** | +23.60 |
+| THYAO | **+3127 R** | +14.25 |
+| TUPRS | **+12420 R** | +27.85 |
+| EREGL | **+2267 R** | +9.47 |
+| GARAN | **+1698 R** | +0.90 |
+| TOASO | **+2995 R** | **−5.94** |
+
+Six of six, by two to three orders of magnitude. The narrowest benchmark,
+GARAN at +1698 R, still beats the system's +0.90 by a factor of roughly 1900.
+On TOASO the system is outright negative while holding the stock returned
++2995 R.
+
+### What this means
+
+- **Eleven of thirteen layers show no measurable contribution.** The system's
+  complexity is not buying anything that appears in the results.
+- **The heaviest-weighted layer is harmful** on the one ticker where it was
+  isolated cleanly, and was disabled for the rest of the work.
+- **The whole apparatus underperforms the null strategy** — buy the stock and
+  hold it — on every ticker tested.
+
+There is no reading of these numbers in which the thirteen-layer design is
+validated. What survives measurement is two layers, one of which is a veto.
+
+### The caveats, stated in full
+
+These bound the finding. They do not rescue it.
+
+- **n is small.** 30–60 signals per ticker on the ablation runs. Nine layers
+  reading as coin flips is a statement about the *absence of a detectable
+  effect at this n*, not proof that each is worthless — a real but small edge
+  would be invisible here.
+- **The benchmark is not like-for-like.** Buy-and-hold compounds; the system
+  risks a fixed unit per trade and never compounds. Part of the gap is that
+  difference rather than skill. The *sign* of the comparison is not in doubt on
+  any of the six; the multiple is overstated.
+- **Six tickers is not the market.** All BIST, all large and liquid, over one
+  window. A different universe or regime could read differently.
+- **L1 was off in all six ablation runs.** Every other layer's `dR` is
+  therefore measured against a system already missing its heaviest layer, and
+  would not necessarily reproduce with L1 restored.
+
+---
+
 ## 1. Stage 10 verification
 
 ### 1a. Static audit — complete
@@ -212,7 +303,9 @@ execution time on long histories. 100 is a compromise, not a maximum.
 | # | Question | Status |
 |---|---|---|
 | Q1 | E1 and E2 defaults from observed MFE/MAE | **Open.** They ship at 1.0 and 2.0 ATR, round numbers rather than measured ones. The `suggest` panel row now produces the readings; they have not been applied |
-| Q2 | Does any layer fail to earn its weight? | **Open.** The harness exists; it has not been run across enough symbols |
-| Q3 | Does the system beat buy-and-hold? | **Open.** The BENCHMARK row exists; no readings recorded |
+| Q2 | Does any layer fail to earn its weight? | **Answered — eleven of thirteen do.** See the headline finding. Only L5 and L3 hold a consistent sign across six tickers; L1 is harmful on BIMAS |
+| Q3 | Does the system beat buy-and-hold? | **Answered — no.** It loses on all six tickers tested, by two to three orders of magnitude. See the headline finding |
 | Q4 | Is E3 viable as a wide catastrophe floor? | **Open.** Hypothesis only, never cleanly measured |
 | Q5 | ADX / EMA loosening | **Recorded — see §3.** Every loosening step degraded quality; no default changed |
+| Q6 | Does the L1 harm generalise beyond BIMAS? | **Open.** L1 was measured on one ticker and then disabled for every subsequent run, so the other five say nothing about it. It needs the same manual isolation on at least three more symbols |
+| Q7 | What is left if the system is rebuilt on L5 and L3 alone? | **Open, and now the first question.** Nine layers show no detectable edge and the full system loses to holding the stock. A two-layer version has not been measured against either the current system or the benchmark |
