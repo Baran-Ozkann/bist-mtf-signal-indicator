@@ -16,13 +16,18 @@
 //  [x] Stage 8  Performance log panel
 //  [x] Stage 8.5 Exit logic (positions, exit rules, comparison)
 //  [x] Stage 9  Unified alertcondition()
-//  [~] Stage 10 End-to-end / repaint testing            <-- CURRENT
+//  [x] Stage 10 End-to-end / repaint testing            <-- CURRENT (closed)
 //        [x] Static audit - no defects found, recorded in the findings doc
 //        [x] Layer ablation harness (14 parallel streams, one pass)
 //        [x] Buy-and-hold benchmark row
 //        [x] README + calibration findings
-//        [ ] Bar-replay repaint runs        - protocol written, awaiting runs
-//        [ ] Ablation cross-check vs manual - protocol written, awaiting runs
+//        [x] Ablation cross-check vs manual - passed on BIMAS L1, see findings
+//        [ ] Bar-replay repaint runs        - NOT PERFORMED. Repaint behaviour
+//            was reasoned about in code review (lookahead_off + gaps_off on
+//            every request.security() call, na-guarded warm-up, pivot levels
+//            locked srRight bars after printing) but never watched on a live
+//            or replayed chart. Protocol is recorded in calibration_findings.md
+//            §1b for whoever picks this back up.
 //
 // ============================================================================
 //  request.security() CALL INVENTORY  (Stage 5)

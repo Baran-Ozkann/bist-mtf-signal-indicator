@@ -124,7 +124,7 @@ defects found; no fixes were required.
 | Session filter on half-days | **Pass.** Time-of-day tests only; nothing assumes a 10:00–18:00 session. See the layer 13 caveat in the README |
 | Drawing budget | **Pass.** `max_labels_count` 500, documented behaviour on overflow |
 
-### 1b. Bar-replay repaint protocol — to be run
+### 1b. Bar-replay repaint protocol — not performed
 
 Static reading cannot settle repaint behaviour; it has to be watched. Run on at
 least two tickers, one liquid and one thin.
@@ -138,7 +138,13 @@ least two tickers, one liquid and one thin.
 | 5 | Let a position open and watch a stop/target level within the forming bar | Level static; the *hit* resolves intrabar and settles at close |
 | 6 | Set `biasConfirmedOnly` **off** and repeat step 1 | Bias now mutates intrabar. Confirms the toggle does what it claims — debugging only |
 
-Results: *not yet recorded.*
+**Not performed.** This protocol was reasoned about instead of watched: every
+`request.security()` call uses `lookahead_off` and `gaps_off` (§ inventory
+above), every layer is `na`-guarded through warm-up, and pivot levels lock
+`srRight` bars after they print and never move afterward. That reasoning is
+not a substitute for the six steps above — none of them were run on a live or
+replayed chart, on any ticker. The project is closing with this open;
+whoever picks it back up should run this table before trusting the tool live.
 
 ### 1c. Ablation harness cross-check — passed
 
