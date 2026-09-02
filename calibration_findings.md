@@ -110,12 +110,28 @@ could looked identical.
 
 ## 3. ADX and EMA loosening tests
 
-*Awaiting measurements.* The settings tried, the tickers, and what moved are
-not recorded anywhere in the source or the commit history, and are not
-reconstructed here.
+BIMAS, 4h, threshold 60, stop 1.0 ATR, `logMaxSignals` 25. One parameter set
+varied per run, everything else held.
 
-To be filled in with: parameters varied and their range, symbols and window,
-the reach or signal-count effect, and whether a default changed as a result.
+| Run | HORIZON | FIXED-R | STRUCT | net bars in 60–69 band | win% |
+|---|---|---|---|---|---|
+| **Baseline** — 1D EMA 21/50/200, ADX > 25 | **+0.35** | **+1.04** | **+0.54** | 326 (3.3%) | **48%** |
+| EMA shortened to 13/34/89, ADX > 25 | +0.07 | +0.77 | +0.51 | 367 (3.7%) | 44% |
+| EMA back to 21/50/200, ADX > 25 → 20 | −0.45 | +0.56 | +0.29 | 489 (4.9%) | 36% |
+
+**Every loosening step raised the signal count and degraded quality
+monotonically.** Both tracks move together and win% falls with them, so this is
+not an artefact of one exit model. Loosening the ADX gate is the more damaging
+of the two: it produced the largest reach gain (3.3% → 4.9% of bars) and the
+only negative `HORIZON` reading in the set.
+
+**Changed: nothing.** The baseline settings were kept — 1D EMA 21/50/200 and
+ADX > 25. Nothing here argued for loosening either.
+
+**Caveat, and it is a large one.** Single ticker, n=25 per run. The later n=100
+retest showed that n=25 results do not hold. Read this as **direction, not
+magnitude** — the ordering of the three runs is the finding; the numbers
+themselves are not reliable at this sample size.
 
 ---
 
@@ -199,4 +215,4 @@ execution time on long histories. 100 is a compromise, not a maximum.
 | Q2 | Does any layer fail to earn its weight? | **Open.** The harness exists; it has not been run across enough symbols |
 | Q3 | Does the system beat buy-and-hold? | **Open.** The BENCHMARK row exists; no readings recorded |
 | Q4 | Is E3 viable as a wide catastrophe floor? | **Open.** Hypothesis only, never cleanly measured |
-| Q5 | ADX / EMA loosening | **Unrecorded** — see §3 |
+| Q5 | ADX / EMA loosening | **Recorded — see §3.** Every loosening step degraded quality; no default changed |
