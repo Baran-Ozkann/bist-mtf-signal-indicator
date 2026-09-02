@@ -4,8 +4,7 @@ What was measured, what it changed, and what remains unsettled.
 
 The stages 1–10 specification defines the entry machinery; `stage_8_5_exit_logic.md`
 covers the exit stage. This document is the evidence trail: the readings that
-moved a default,
-and the readings that refused to settle a question.
+moved a default, and the readings that refused to settle a question.
 
 **Read every finding with its *n*.** Most of what follows rests on one or two
 symbols. That is enough to change a default away from an arbitrary placeholder;
