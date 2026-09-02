@@ -49,7 +49,7 @@ least two tickers, one liquid and one thin.
 
 Results: *not yet recorded.*
 
-### 1c. Ablation harness cross-check — to be run
+### 1c. Ablation harness cross-check — passed
 
 The harness computes what the manual method would, without the reloads, so it
 must be validated against the manual method once before its numbers are
@@ -65,7 +65,15 @@ harness omits the position filter by design, so its BASE sees more signals than
 the log does. A disagreement in *sign* means the harness is wrong and nothing
 should be concluded from it until that is resolved.
 
-Results: *not yet recorded.*
+**Result: passed.** On BIMAS, layer 1. The harness reported `dR` +0.26.
+Disabling L1 by hand with *Renormalise* on moved the `HORIZON` row from **+0.19
+to +0.71** — a manual delta of +0.52. Same sign, larger magnitude, which is the
+disagreement the design predicts: the harness's BASE sees signals the position
+filter keeps out of the log.
+
+The harness's numbers are used from here on. Note what the check does and does
+not establish — one symbol, one layer, and it shows the harness is not
+sign-inverted, not that its magnitudes are accurate.
 
 ---
 
